@@ -6,7 +6,7 @@ set -e
 echo "=== Polymarket数据收集系统 VPS部署 ==="
 
 # 配置变量
-BASE_DIR="${HOME}/polymarket"
+BASE_DIR="/home/ubuntu/trader-data-collect"
 REAL_HOT="${BASE_DIR}/real_hot"
 REAL_ARCHIVE="${BASE_DIR}/real_archive"
 SCRIPTS_DIR="${BASE_DIR}/scripts"

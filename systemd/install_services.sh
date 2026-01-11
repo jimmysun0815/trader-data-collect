@@ -6,7 +6,7 @@ set -e
 echo "=== Polymarket采集器 Systemd服务安装 ==="
 
 # 配置变量
-SERVICE_DIR="${HOME}/polymarket/systemd"
+SERVICE_DIR="/home/ubuntu/trader-data-collect/systemd"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 
 # 1. 检查systemd是否支持用户服务
@@ -29,7 +29,7 @@ echo "3. 安装服务文件..."
 
 if [ ! -d "${SERVICE_DIR}" ]; then
     echo "   错误: 服务文件目录不存在: ${SERVICE_DIR}"
-    echo "   请先上传systemd/目录到 ${HOME}/polymarket/"
+    echo "   请先上传systemd/目录到 /home/ubuntu/trader-data-collect/"
     exit 1
 fi
 

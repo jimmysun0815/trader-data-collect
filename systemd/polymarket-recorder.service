@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=%u
-WorkingDirectory=%h/polymarket/scripts
-ExecStart=%h/polymarket/venv/bin/python3 %h/polymarket/scripts/polymarket_multi_market_recorder.py
+User=ubuntu
+WorkingDirectory=/home/ubuntu/trader-data-collect/scripts
+ExecStart=/home/ubuntu/trader-data-collect/venv/bin/python3 /home/ubuntu/trader-data-collect/scripts/polymarket_multi_market_recorder.py
 
 # 自动重启
 Restart=always
