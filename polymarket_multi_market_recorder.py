@@ -165,19 +165,57 @@ def collect_market_tick(market_info: Dict, market_key: str) -> Optional[Dict]:
             "tokens": []
         }
         
-        # 获取每个token的orderbook
-        tokens = market_info.get("tokens", [])
-        if not tokens and market_info:
-            # 兜底：尝试从其他字段提取token信息
-            pass
+        # 获取token IDs - 优先从clobTokenIds提取
+        token_ids = []
+        outcomes = []
         
-        for token in tokens[:2]:  # 通常只有Yes/No两个
-            # 尝试多种可能的token_id字段
-            token_id = (token.get("token_id") or 
-                       token.get("clobTokenId") or 
-                       token.get("clob_token_id") or 
-                       token.get("tokenId"))
-            
+        # 方法1: 从clobTokenIds提取
+        clob_ids = market_info.get("clobTokenIds")
+        if clob_ids:
+            # 可能是字符串 '["id1","id2"]' 或列表 ["id1","id2"]
+            if isinstance(clob_ids, str):
+                try:
+                    import json as json_module
+                    token_ids = json_module.loads(clob_ids)
+                except:
+                    pass
+            elif isinstance(clob_ids, list):
+                token_ids = clob_ids
+        
+        # 方法2: 从tokens字段提取（旧格式）
+        if not token_ids:
+            tokens_field = market_info.get("tokens", [])
+            for token in tokens_field:
+                tid = (token.get("token_id") or 
+                      token.get("clobTokenId") or 
+                      token.get("clob_token_id") or 
+                      token.get("tokenId"))
+                if tid:
+                    token_ids.append(str(tid))
+                    outcomes.append(token.get("outcome") or token.get("name") or "")
+        
+        # 提取outcomes
+        if not outcomes:
+            outcomes_field = market_info.get("outcomes")
+            if isinstance(outcomes_field, str):
+                try:
+                    import json as json_module
+                    outcomes = json_module.loads(outcomes_field)
+                except:
+                    outcomes = outcomes_field.split(",") if outcomes_field else []
+            elif isinstance(outcomes_field, list):
+                outcomes = outcomes_field
+        
+        # 确保outcomes和token_ids长度一致
+        while len(outcomes) < len(token_ids):
+            outcomes.append(f"Outcome {len(outcomes)}")
+        
+        # DEBUG: 如果还是没有token_ids
+        if not token_ids:
+            print(f"[DEBUG] {market_key} - Failed to extract token_ids", file=sys.stderr)
+            print(f"[DEBUG] {market_key} - clobTokenIds: {market_info.get('clobTokenIds')}", file=sys.stderr)
+        
+        for i, token_id in enumerate(token_ids[:2]):  # 通常只有Yes/No两个
             if not token_id:
                 continue
             
@@ -214,7 +252,7 @@ def collect_market_tick(market_info: Dict, market_key: str) -> Optional[Dict]:
                         continue
                 
                 tick["tokens"].append({
-                    "outcome": token.get("outcome") or token.get("name"),
+                    "outcome": outcomes[i] if i < len(outcomes) else f"Token{i}",
                     "token_id": str(token_id),
                     "orderbook": {
                         "bids": bids_formatted,
@@ -269,7 +307,7 @@ def main():
                 need_update = False
                 if market_key not in current_markets:
                     need_update = True
-                elif current_markets[market_key]["info"]["slug"] != slug:
+                elif current_markets[market_key].get("slug") != slug:
                     # 窗口切换，关闭旧文件
                     old_file = current_markets[market_key].get("file")
                     if old_file:
