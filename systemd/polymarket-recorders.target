@@ -1,0 +1,8 @@
+[Unit]
+Description=Polymarket Data Collection Services
+After=network.target
+
+[Install]
+WantedBy=multi-user.target
+Requires=polymarket-recorder.service cex-recorder.service
+

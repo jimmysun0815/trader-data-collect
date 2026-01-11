@@ -1,0 +1,30 @@
+[Unit]
+Description=Polymarket Multi-Market Data Recorder
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%u
+WorkingDirectory=%h/polymarket/scripts
+ExecStart=%h/polymarket/venv/bin/python3 %h/polymarket/scripts/polymarket_multi_market_recorder.py
+
+# 自动重启
+Restart=always
+RestartSec=10
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polymarket-recorder
+
+# 资源限制
+MemoryLimit=512M
+CPUQuota=50%
+
+# 环境变量（如果需要）
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
+

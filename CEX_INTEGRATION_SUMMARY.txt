@@ -1,0 +1,165 @@
+✅ CEX数据采集已集成到远程收集系统
+
+## 📊 支持的数据源
+
+现在系统支持两种数据源的远程采集：
+
+### 1. Polymarket数据
+- **类型**: BTC/ETH 15分钟涨跌预测市场
+- **格式**: JSONL（按窗口切分）
+- **存储**: VPS的 `real_hot/` → 7天后自动归档到 `real_archive/`
+- **访问**: SSHFS实时挂载 + 冷数据按需拉取
+- **脚本**: `polymarket_btc15m_record.py`
+- **数据量**: ~500MB/天
+
+### 2. CEX数据（🆕）
+- **类型**: 多交易所订单簿（Binance, OKX, Bybit）
+- **格式**: CSV时间序列（单文件追加）
+- **存储**: VPS的 `logs/cex_multi_venue_books.csv`
+- **访问**: 定期同步到本地（rsync）
+- **脚本**: `cex_multi_venue_recorder.py`
+- **数据量**: ~80MB/天
+
+## 🔄 数据流程
+
+```
+VPS服务器
+├── Polymarket采集 → real_hot/ → 自动归档 → real_archive/
+│                      ↓ SSHFS
+│                   本地real_hot/（实时挂载）
+│
+└── CEX采集 → logs/cex_multi_venue_books.csv
+                 ↓ rsync同步
+              本地real/cex_multi_venue_books.csv
+```
+
+## 📦 新增文件
+
+1. **CEX_DATA_ACCESS.md** - CEX数据访问完整文档
+   - 数据格式说明
+   - 3种访问方式
+   - 管理命令
+   - 与Polymarket数据的对比
+   - 联合使用示例
+
+2. **sync_cex_data.sh** - CEX数据同步工具
+   - 一键同步远程CSV到本地
+   - 显示文件大小和同步进度
+   - 支持定时任务配置
+
+## 🚀 快速使用
+
+### 在VPS上启动CEX采集
+
+```bash
+ssh $VPS_USER@$VPS_HOST
+cd ~/polymarket/scripts
+
+# 启动CEX数据采集（后台）
+nohup python3 cex_multi_venue_recorder.py \
+    --out ~/polymarket/logs/cex_multi_venue_books.csv \
+    --hz 1.0 \
+    --venues binance_spot,okx_spot,bybit_spot \
+    > ~/polymarket/logs/cex.log 2>&1 &
+
+# 查看日志
+tail -f ~/polymarket/logs/cex.log
+```
+
+### 在本地同步CEX数据
+
+```bash
+cd collect_data
+
+# 同步到本地
+./sync_cex_data.sh
+
+# 或设置定时同步（每30分钟）
+crontab -e
+# 添加: */30 * * * * /path/to/collect_data/sync_cex_data.sh >> /tmp/cex_sync.log 2>&1
+```
+
+### 联合使用两种数据
+
+```python
+import pandas as pd
+import sys
+
+# Polymarket数据（热/冷自动路由）
+sys.path.insert(0, '/path/to/collect_data')
+from data_accessor import DataAccessor
+
+accessor = DataAccessor()
+poly_windows = accessor.list_all_windows()
+
+# CEX数据（本地CSV）
+cex_df = pd.read_csv("../real/cex_multi_venue_books.csv")
+
+# 联合分析
+for ws in poly_windows[-10:]:
+    poly_path = accessor.get_window_jsonl(ws)
+    # 获取该窗口对应的CEX数据...
+```
+
+## 📝 已更新的文档
+
+1. **README.md** - 添加了CEX数据源说明
+2. **GETTING_STARTED.md** - 添加了CEX采集启动步骤
+3. **QUICK_REFERENCE.md** - 添加了CEX相关命令
+4. **deploy_vps.sh** - 更新了启动说明
+
+## 💡 为什么CEX数据用不同方式？
+
+| 特性 | Polymarket | CEX |
+|------|-----------|-----|
+| 文件数量 | 很多（每窗口一个） | 单一文件 |
+| 文件大小 | 每个~500KB | 累积增长 |
+| 访问模式 | 按需访问单窗口 | 读取整个序列 |
+| 适合方式 | SSHFS + 按需拉取 | 定期同步 |
+
+**结论**: 
+- Polymarket用SSHFS实时访问 + 冷数据按需拉取（完美匹配）
+- CEX用简单的rsync定期同步（更高效）
+
+## 🎯 优势
+
+✅ **统一VPS部署** - 一次配置，两种数据源同时收集  
+✅ **各取所长** - Polymarket用SSHFS，CEX用rsync  
+✅ **本地空间优化** - 两种数据加起来 < 10GB  
+✅ **灵活访问** - Polymarket实时，CEX定期同步  
+✅ **完整文档** - 每种数据源都有详细说明
+
+## 📚 文档清单
+
+现在collect_data文件夹包含：
+
+**核心脚本（8个）**:
+- deploy_vps.sh, archive_old_data.py, setup_sshfs_mount.sh
+- data_accessor.py, data_path_compat.py
+- monitor_sync.py, diagnose_remote_setup.py, example_migration.py
+
+**数据工具（2个）**:
+- sync_cex_data.sh ← 🆕 CEX数据同步
+- check_deployment.sh, list_files.py
+
+**文档（6个）**:
+- README.md - 系统总览
+- GETTING_STARTED.md - 5分钟入门
+- CEX_DATA_ACCESS.md ← 🆕 CEX数据完整文档
+- REMOTE_DATA_SETUP.md - 完整设置
+- MIGRATION_GUIDE.md - 迁移指南
+- QUICK_REFERENCE.md - 快速参考
+- IMPLEMENTATION_SUMMARY.md - 实施总结
+
+## 🎉 全部完成！
+
+现在你可以在VPS上同时运行：
+1. **Polymarket数据采集** - 实时盘口和市场数据
+2. **CEX数据采集** - 多交易所订单簿
+
+本地通过不同方式访问：
+1. **Polymarket** - SSHFS挂载（热数据）+ 按需拉取（冷数据）
+2. **CEX** - 定期同步CSV文件
+
+系统完全准备好用于你的交易策略开发和回测！
+
