@@ -5,9 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/trader-data-collect/scripts
-ExecStart=/home/ubuntu/trader-data-collect/venv/bin/python3 /home/ubuntu/trader-data-collect/scripts/cex_multi_asset_recorder.py
+WorkingDirectory=/home/ubuntu/trader-data-collect
+ExecStart=/home/ubuntu/trader-data-collect/venv/bin/python3 /home/ubuntu/trader-data-collect/cex_multi_asset_recorder.py
 
 # 自动重启
 Restart=always

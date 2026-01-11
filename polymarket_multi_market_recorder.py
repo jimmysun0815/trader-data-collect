@@ -26,7 +26,7 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 
 # 输出目录
-OUTPUT_DIR = Path(__file__).parent.parent / "real_hot"
+OUTPUT_DIR = Path(__file__).parent / "real_hot"
 
 # 市场配置
 MARKETS = {
@@ -93,19 +93,36 @@ def get_1hour_market_slug(asset: str, target_time: Optional[datetime] = None) ->
 
 def fetch_market_info(slug: str) -> Optional[Dict]:
     """通过slug获取市场信息"""
+    # 方法1: 使用 /markets/slug/{slug} (推荐)
+    try:
+        url = f"{GAMMA_API}/markets/slug/{slug}"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        # Gamma有时会包一层 {"market": {...}}
+        if isinstance(data, dict) and isinstance(data.get("market"), dict):
+            return data["market"]
+        if isinstance(data, dict):
+            return data
+    except Exception as e:
+        print(f"[WARN] Failed to fetch market by slug endpoint {slug}: {e}", file=sys.stderr)
+    
+    # 方法2: 兜底，使用search
     try:
         url = f"{GAMMA_API}/markets"
-        resp = requests.get(url, params={"slug": slug}, timeout=10)
+        resp = requests.get(url, params={"limit": 50, "search": slug}, timeout=10)
         resp.raise_for_status()
-        
         markets = resp.json()
-        if not markets:
-            return None
         
-        return markets[0]
+        if isinstance(markets, list):
+            for m in markets:
+                if isinstance(m, dict) and m.get("slug") == slug:
+                    return m
     except Exception as e:
         print(f"[ERROR] Failed to fetch market {slug}: {e}", file=sys.stderr)
-        return None
+    
+    return None
 
 
 def fetch_orderbook(token_id: str) -> Optional[Dict]:
@@ -149,17 +166,60 @@ def collect_market_tick(market_info: Dict, market_key: str) -> Optional[Dict]:
         }
         
         # 获取每个token的orderbook
-        for token in market_info.get("tokens", [])[:2]:  # 通常只有Yes/No两个
-            token_id = token.get("token_id")
+        tokens = market_info.get("tokens", [])
+        if not tokens and market_info:
+            # 兜底：尝试从其他字段提取token信息
+            pass
+        
+        for token in tokens[:2]:  # 通常只有Yes/No两个
+            # 尝试多种可能的token_id字段
+            token_id = (token.get("token_id") or 
+                       token.get("clobTokenId") or 
+                       token.get("clob_token_id") or 
+                       token.get("tokenId"))
+            
             if not token_id:
                 continue
             
-            orderbook = fetch_orderbook(token_id)
+            orderbook = fetch_orderbook(str(token_id))
             if orderbook:
+                # 提取bids和asks
+                bids = orderbook.get("bids", [])
+                asks = orderbook.get("asks", [])
+                
+                # 转换格式：[{"price": "0.5", "size": "100"}] -> [[0.5, 100]]
+                bids_formatted = []
+                asks_formatted = []
+                
+                for bid in bids:
+                    try:
+                        if isinstance(bid, dict):
+                            p = float(bid.get("price", 0))
+                            s = float(bid.get("size", 0))
+                            bids_formatted.append([p, s])
+                        elif isinstance(bid, list) and len(bid) >= 2:
+                            bids_formatted.append([float(bid[0]), float(bid[1])])
+                    except:
+                        continue
+                
+                for ask in asks:
+                    try:
+                        if isinstance(ask, dict):
+                            p = float(ask.get("price", 0))
+                            s = float(ask.get("size", 0))
+                            asks_formatted.append([p, s])
+                        elif isinstance(ask, list) and len(ask) >= 2:
+                            asks_formatted.append([float(ask[0]), float(ask[1])])
+                    except:
+                        continue
+                
                 tick["tokens"].append({
-                    "outcome": token.get("outcome"),
-                    "token_id": token_id,
-                    "orderbook": orderbook
+                    "outcome": token.get("outcome") or token.get("name"),
+                    "token_id": str(token_id),
+                    "orderbook": {
+                        "bids": bids_formatted,
+                        "asks": asks_formatted
+                    }
                 })
         
         return tick if tick["tokens"] else None
@@ -249,13 +309,15 @@ def main():
                         file_handle.write(json.dumps(tick) + "\n")
                         file_handle.flush()
                         
-                        # 简单输出状态
-                        if len(tick["tokens"]) >= 2:
-                            yes_book = tick["tokens"][0]["orderbook"]
-                            best_bid = yes_book.get("bids", [[None]])[0]
-                            best_ask = yes_book.get("asks", [[None]])[0]
-                            print(f"[{market_key}] bid={best_bid[0] if best_bid[0] else 'N/A'} "
-                                  f"ask={best_ask[0] if best_ask[0] else 'N/A'}")
+                        # 输出状态
+                        if len(tick["tokens"]) >= 1:
+                            token_book = tick["tokens"][0]["orderbook"]
+                            bids = token_book.get("bids", [])
+                            asks = token_book.get("asks", [])
+                            best_bid = bids[0][0] if bids and len(bids[0]) > 0 else None
+                            best_ask = asks[0][0] if asks and len(asks[0]) > 0 else None
+                            print(f"[{market_key}] bid={best_bid if best_bid else 'N/A'} "
+                                  f"ask={best_ask if best_ask else 'N/A'}", flush=True)
             
             # 每秒采集一次
             time.sleep(1)

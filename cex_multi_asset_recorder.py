@@ -355,7 +355,7 @@ class AssetRecorder:
 
 def main():
     """主循环"""
-    output_dir = Path(__file__).parent.parent / "real_hot"
+    output_dir = Path(__file__).parent / "real_hot"
     hz = 1.0  # 每秒采集1次
     band_bps = 10.0
     limit = 200
