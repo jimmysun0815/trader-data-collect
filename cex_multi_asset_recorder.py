@@ -267,7 +267,9 @@ class AssetRecorder:
                 self.current_file.flush()
     
     def _fetch_venue(self, venue: str) -> tuple[str, Optional[VenueBook], str]:
-        """获取单个venue的数据（用于并行）"""
+        """获取单个venue的数据（用于并行）
+        返回: (venue名称, book数据或None, 错误信息)
+        """
         try:
             if venue == "binance_spot":
                 book = fetch_binance_depth(
@@ -306,35 +308,56 @@ class AssetRecorder:
                     self.timeout_s,
                     venue
                 )
+            else:
+                return venue, None, "Unknown venue"
+            
+            return venue, book, ""
+            
+        except Exception as e:
+            msg = str(e).replace("\n", " ")
+            if len(msg) > 240:
+                msg = msg[:240] + "…"
+            return venue, None, f"{type(e).__name__}: {msg}"
+    
+    def collect_tick(self):
+        """采集一个tick的数据（并行请求所有venue）"""
+        self._check_rotate_file()
+        
+        t0 = time.time()
+        ts = utc_ts()
+        self.sample_id += 1
+        
+        # 并行请求所有venue（最多5个线程）
+        with ThreadPoolExecutor(max_workers=len(VENUES)) as executor:
+            # 提交所有请求
+            futures = {
+                executor.submit(self._fetch_venue, venue): venue 
+                for venue in VENUES
+            }
+            
+            # 收集结果并写入CSV
+            for future in as_completed(futures):
+                venue, book, err = future.result()
+                
+                if book and not err:
+                    # 成功 - 写入完整数据
+                    feats = compute_features(book, self.band_bps)
+                    self.current_writer.writerow([
+                        ts, f"{t0:.6f}", self.sample_id, venue,
+                        book.best_bid, book.best_ask, book.mid, book.spread,
+                        book.bid_qty_l1, book.ask_qty_l1,
+                        feats["bid_notional"], feats["ask_notional"],
+                        feats["imb"], feats["micro"], feats["micro_edge"],
+                        ""
+                    ])
                 else:
-                    raise ValueError(f"Unknown venue: {venue}")
-                
-                # 计算特征
-                feats = compute_features(book, self.band_bps)
-                
-                # 写入CSV
-                self.current_writer.writerow([
-                    ts, f"{t0:.6f}", self.sample_id, venue,
-                    book.best_bid, book.best_ask, book.mid, book.spread,
-                    book.bid_qty_l1, book.ask_qty_l1,
-                    feats["bid_notional"], feats["ask_notional"],
-                    feats["imb"], feats["micro"], feats["micro_edge"],
-                    ""
-                ])
-                
-            except Exception as e:
-                # 记录错误行
-                msg = str(e).replace("\n", " ")
-                if len(msg) > 240:
-                    msg = msg[:240] + "…"
-                err = f"{type(e).__name__}: {msg}"
-                
-                self.current_writer.writerow([
-                    ts, f"{t0:.6f}", self.sample_id, venue,
-                    "", "", "", "", "", "",
-                    "", "", "", "", "",
-                    err
-                ])
+                    # 失败 - 写入错误行
+                    self.current_writer.writerow([
+                        ts, f"{t0:.6f}", self.sample_id, venue,
+                        "", "", "", "", "", "",
+                        "", "", "", "", "",
+                        err
+                    ])
         
         # 刷新到磁盘
         self.current_file.flush()
