@@ -268,9 +268,8 @@ def collect_market_tick(market_info: Dict, market_key: str) -> Optional[Dict]:
 
 
 def get_output_file(market_slug: str) -> Path:
-    """获取输出文件路径"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{market_slug}_{timestamp}.jsonl"
+    """获取输出文件路径（基于market_slug，不含启动时间戳）"""
+    filename = f"{market_slug}.jsonl"
     return OUTPUT_DIR / filename
 
 

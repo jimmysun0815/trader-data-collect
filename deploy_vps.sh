@@ -51,9 +51,9 @@ echo "   依赖安装完成"
 
 # 5. 设置定时归档任务
 echo ""
-echo "5. 设置定时归档任务（每天凌晨4点）..."
+echo "5. 设置定时归档任务（每天凌晨4点，归档30天前数据）..."
 
-CRON_CMD="${BASE_DIR}/venv/bin/python3 ${SCRIPTS_DIR}/archive_old_data.py >> ${BASE_DIR}/logs/archive.log 2>&1"
+CRON_CMD="${BASE_DIR}/venv/bin/python3 ${SCRIPTS_DIR}/archive_old_data.py --days 30 >> ${BASE_DIR}/logs/archive.log 2>&1"
 CRON_ENTRY="0 4 * * * ${CRON_CMD}"
 
 # 检查crontab是否已存在该任务

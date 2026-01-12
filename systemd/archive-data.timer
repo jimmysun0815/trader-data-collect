@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily Archive Timer for Polymarket Old Data
+Requires=archive-data.service
+
+[Timer]
+# 每天凌晨4点运行
+OnCalendar=*-*-* 04:00:00
+# 如果错过了执行时间（如机器关机），启动后立即执行
+Persistent=true
+# 随机延迟0-300秒，避免与其他定时任务冲突
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+

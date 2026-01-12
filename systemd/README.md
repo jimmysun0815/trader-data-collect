@@ -7,7 +7,10 @@ systemd/
 ├── polymarket-recorder.service      # Polymarket采集服务
 ├── cex-recorder.service             # CEX采集服务
 ├── polymarket-recorders.target      # 统一管理target
+├── archive-data.service             # 数据归档服务
+├── archive-data.timer               # 定时归档timer（每天4am）
 ├── install_services.sh              # 一键安装脚本
+├── README.md                        # 本文件
 └── SYSTEMD_GUIDE.md                 # 完整指南
 ```
 
@@ -36,11 +39,18 @@ chmod +x install_services.sh
 ### 3. 启动服务
 
 ```bash
-# 启动
+# 启动数据采集服务
 systemctl --user start polymarket-recorder.service cex-recorder.service
+
+# 启动定时归档
+systemctl --user start archive-data.timer
 
 # 查看状态
 systemctl --user status polymarket-recorder.service
+systemctl --user status archive-data.timer
+
+# 查看定时器列表
+systemctl --user list-timers
 
 # 查看日志
 journalctl --user -u polymarket-recorder.service -f
@@ -98,6 +108,9 @@ journalctl --user -u polymarket-recorder.service -p err
 
 # 两个服务的日志
 journalctl --user -u polymarket-recorder.service -u cex-recorder.service -f
+
+# 归档任务日志
+journalctl --user -u archive-data.service -n 50
 ```
 
 ### 开机自启
@@ -220,6 +233,22 @@ systemctl --user enable polymarket-recorder.service
 ---
 
 ## 💡 快速提示
+
+### 查看定时归档状态
+
+```bash
+# 查看所有定时器
+systemctl --user list-timers
+
+# 查看归档timer详情
+systemctl --user status archive-data.timer
+
+# 手动触发归档（测试用）
+systemctl --user start archive-data.service
+
+# 查看归档日志
+journalctl --user -u archive-data.service -n 50
+```
 
 ### 一行命令启动所有采集器
 

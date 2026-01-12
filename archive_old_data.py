@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-VPS自动归档脚本 - 将超过7天的数据从real_hot/迁移到real_archive/
+VPS自动归档脚本 - 将超过30天的数据从real_hot/迁移到real_archive/
 
 功能：
 1. 扫描real_hot/目录下的btc-updown-15m-*.jsonl文件
-2. 识别超过7天的文件（基于文件名中的时间戳）
+2. 识别超过30天的文件（基于文件名中的时间戳）
 3. 按月归档到real_archive/YYYY-MM/目录
 4. 可选压缩（gzip）
 5. 记录归档日志
 
 用法：
-  python3 archive_old_data.py [--dry-run] [--compress] [--days 7]
+  python3 archive_old_data.py [--dry-run] [--compress] [--days 30]
 """
 
 from __future__ import annotations
@@ -168,8 +168,8 @@ def main():
     parser.add_argument(
         "--days",
         type=int,
-        default=7,
-        help="归档阈值天数（默认: 7天）",
+        default=30,
+        help="归档阈值天数（默认: 30天）",
     )
     parser.add_argument(
         "--compress",

@@ -33,7 +33,7 @@ if [ ! -d "${SERVICE_DIR}" ]; then
     exit 1
 fi
 
-for service in polymarket-recorder.service cex-recorder.service polymarket-recorders.target; do
+for service in polymarket-recorder.service cex-recorder.service polymarket-recorders.target archive-data.service archive-data.timer; do
     if [ -f "${SERVICE_DIR}/${service}" ]; then
         cp "${SERVICE_DIR}/${service}" "${SYSTEMD_USER_DIR}/"
         echo "   ✓ 已安装: ${service}"
@@ -52,7 +52,9 @@ echo ""
 echo "5. 启用服务（开机自启）..."
 systemctl --user enable polymarket-recorder.service
 systemctl --user enable cex-recorder.service
+systemctl --user enable archive-data.timer
 echo "   ✓ 服务已设置为开机自启"
+echo "   ✓ 归档定时器已启用（每天凌晨4点）"
 
 # 6. 显示服务状态
 echo ""
@@ -62,6 +64,9 @@ echo "常用命令："
 echo ""
 echo "# 启动所有采集器"
 echo "systemctl --user start polymarket-recorder.service cex-recorder.service"
+echo ""
+echo "# 启动归档定时器"
+echo "systemctl --user start archive-data.timer"
 echo ""
 echo "# 停止所有采集器"
 echo "systemctl --user stop polymarket-recorder.service cex-recorder.service"
@@ -73,15 +78,24 @@ echo ""
 echo "# 查看状态"
 echo "systemctl --user status polymarket-recorder.service"
 echo "systemctl --user status cex-recorder.service"
+echo "systemctl --user status archive-data.timer"
+echo ""
+echo "# 手动触发归档（测试用）"
+echo "systemctl --user start archive-data.service"
+echo ""
+echo "# 查看定时器列表"
+echo "systemctl --user list-timers"
 echo ""
 echo "# 查看日志（实时）"
 echo "journalctl --user -u polymarket-recorder.service -f"
 echo "journalctl --user -u cex-recorder.service -f"
+echo "journalctl --user -u archive-data.service -f"
 echo ""
 echo "# 查看最近日志"
 echo "journalctl --user -u polymarket-recorder.service -n 100"
 echo "journalctl --user -u cex-recorder.service -n 100"
+echo "journalctl --user -u archive-data.service -n 50"
 echo ""
 echo "现在运行以下命令启动服务："
-echo "systemctl --user start polymarket-recorder.service cex-recorder.service"
+echo "systemctl --user start polymarket-recorder.service cex-recorder.service archive-data.timer"
 
