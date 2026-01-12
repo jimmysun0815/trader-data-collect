@@ -1,14 +1,25 @@
 #!/bin/bash
 # SSHFS自动挂载配置脚本 - 在本地Mac上运行
+#
+# 用法:
+#   方式1: 使用AWS .pem密钥（推荐用于EC2）
+#     VPS_USER=ubuntu VPS_HOST=1.2.3.4 VPS_PEM_KEY=~/path/to/key.pem ./setup_sshfs_mount.sh
+#
+#   方式2: 使用标准SSH密钥（~/.ssh/id_rsa）
+#     VPS_USER=ubuntu VPS_HOST=1.2.3.4 ./setup_sshfs_mount.sh
+#
+#   方式3: 交互式配置
+#     编辑下面的配置变量，然后运行: ./setup_sshfs_mount.sh
 
 set -e
 
 echo "=== Polymarket SSHFS挂载配置 ==="
 
 # 配置变量（请根据实际情况修改）
-VPS_USER="${VPS_USER:-your_username}"
+VPS_USER="${VPS_USER:-ubuntu}"
 VPS_HOST="${VPS_HOST:-your_vps_ip}"
-VPS_REMOTE_PATH="${VPS_REMOTE_PATH:-/home/${VPS_USER}/polymarket/real_hot}"
+VPS_PEM_KEY="${VPS_PEM_KEY:-}"  # AWS .pem文件路径（可选）
+VPS_REMOTE_PATH="${VPS_REMOTE_PATH:-/home/ubuntu/trader-data-collect/real_hot}"
 LOCAL_MOUNT_POINT="${HOME}/Desktop/workspace/polymarket/real_hot"
 
 # 颜色输出
@@ -44,38 +55,69 @@ fi
 echo ""
 echo "2. 检查SSH密钥配置..."
 
-SSH_KEY="${HOME}/.ssh/id_rsa"
-if [ ! -f "${SSH_KEY}" ]; then
-    echo -e "${YELLOW}   未找到SSH密钥，生成新密钥...${NC}"
-    ssh-keygen -t rsa -b 4096 -f "${SSH_KEY}" -N ""
-    echo -e "${GREEN}   SSH密钥已生成${NC}"
-fi
-
-echo ""
-echo -e "${YELLOW}重要: 请将以下公钥添加到VPS的 ~/.ssh/authorized_keys${NC}"
-echo "====== 复制以下内容 ======"
-cat "${SSH_KEY}.pub"
-echo "=========================="
-echo ""
-read -p "已添加公钥到VPS? (y/n) " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "请先配置SSH密钥后再运行此脚本"
-    exit 1
+# 检查是否使用PEM密钥
+if [ -n "${VPS_PEM_KEY}" ]; then
+    if [ ! -f "${VPS_PEM_KEY}" ]; then
+        echo -e "${RED}   ✗ PEM密钥文件不存在: ${VPS_PEM_KEY}${NC}"
+        exit 1
+    fi
+    
+    # 检查PEM文件权限（必须是400或600）
+    PEM_PERMS=$(stat -f "%OLp" "${VPS_PEM_KEY}" 2>/dev/null || stat -c "%a" "${VPS_PEM_KEY}" 2>/dev/null)
+    if [ "$PEM_PERMS" != "400" ] && [ "$PEM_PERMS" != "600" ]; then
+        echo -e "${YELLOW}   ⚠ PEM密钥权限不正确，正在修复...${NC}"
+        chmod 400 "${VPS_PEM_KEY}"
+    fi
+    
+    SSH_KEY="${VPS_PEM_KEY}"
+    echo -e "${GREEN}   ✓ 使用PEM密钥: ${SSH_KEY}${NC}"
+    SKIP_KEY_COPY=true
+else
+    # 使用标准SSH密钥
+    SSH_KEY="${HOME}/.ssh/id_rsa"
+    if [ ! -f "${SSH_KEY}" ]; then
+        echo -e "${YELLOW}   未找到SSH密钥，生成新密钥...${NC}"
+        ssh-keygen -t rsa -b 4096 -f "${SSH_KEY}" -N ""
+        echo -e "${GREEN}   SSH密钥已生成${NC}"
+    fi
+    
+    echo ""
+    echo -e "${YELLOW}重要: 请将以下公钥添加到VPS的 ~/.ssh/authorized_keys${NC}"
+    echo "====== 复制以下内容 ======"
+    cat "${SSH_KEY}.pub"
+    echo "=========================="
+    echo ""
+    read -p "已添加公钥到VPS? (y/n) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "请先配置SSH密钥后再运行此脚本"
+        exit 1
+    fi
+    SKIP_KEY_COPY=false
 fi
 
 # 3. 测试SSH连接
 echo ""
 echo "3. 测试SSH连接..."
 
-if ssh -o ConnectTimeout=5 -o BatchMode=yes "${VPS_USER}@${VPS_HOST}" "echo '连接成功'" 2>/dev/null; then
+SSH_OPTS="-o ConnectTimeout=5 -o BatchMode=yes"
+if [ -n "${VPS_PEM_KEY}" ]; then
+    SSH_OPTS="${SSH_OPTS} -i ${VPS_PEM_KEY}"
+fi
+
+if ssh ${SSH_OPTS} "${VPS_USER}@${VPS_HOST}" "echo '连接成功'" 2>/dev/null; then
     echo -e "${GREEN}   ✓ SSH连接测试成功${NC}"
 else
     echo -e "${RED}   ✗ SSH连接失败${NC}"
     echo "   请检查:"
     echo "   - VPS地址是否正确: ${VPS_HOST}"
     echo "   - 用户名是否正确: ${VPS_USER}"
-    echo "   - SSH密钥是否已添加到VPS"
+    if [ -n "${VPS_PEM_KEY}" ]; then
+        echo "   - PEM密钥是否正确: ${VPS_PEM_KEY}"
+        echo "   - PEM密钥权限是否为400/600"
+    else
+        echo "   - SSH密钥是否已添加到VPS"
+    fi
     echo "   - VPS防火墙是否允许SSH连接"
     exit 1
 fi
@@ -104,6 +146,7 @@ cat > "${MOUNT_SCRIPT}" << 'EOF'
 
 VPS_USER="%%VPS_USER%%"
 VPS_HOST="%%VPS_HOST%%"
+VPS_PEM_KEY="%%VPS_PEM_KEY%%"
 VPS_REMOTE_PATH="%%VPS_REMOTE_PATH%%"
 LOCAL_MOUNT_POINT="%%LOCAL_MOUNT_POINT%%"
 
@@ -116,14 +159,21 @@ fi
 # 确保挂载点存在
 mkdir -p "${LOCAL_MOUNT_POINT}"
 
+# 构建sshfs命令
+SSHFS_OPTS="-o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3"
+SSHFS_OPTS="${SSHFS_OPTS} -o cache=yes,kernel_cache"
+SSHFS_OPTS="${SSHFS_OPTS} -o follow_symlinks"
+SSHFS_OPTS="${SSHFS_OPTS} -o Ciphers=aes128-gcm@openssh.com"
+SSHFS_OPTS="${SSHFS_OPTS} -o volname=PolymarketData"
+
+# 如果有PEM密钥，添加到选项
+if [ -n "${VPS_PEM_KEY}" ] && [ "${VPS_PEM_KEY}" != "NONE" ]; then
+    SSHFS_OPTS="${SSHFS_OPTS} -o IdentityFile=${VPS_PEM_KEY}"
+fi
+
 # 执行挂载
 echo "挂载Polymarket数据..."
-sshfs "${VPS_USER}@${VPS_HOST}:${VPS_REMOTE_PATH}" "${LOCAL_MOUNT_POINT}" \
-    -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3 \
-    -o cache=yes,kernel_cache \
-    -o follow_symlinks \
-    -o Ciphers=aes128-gcm@openssh.com \
-    -o volname=PolymarketData
+sshfs "${VPS_USER}@${VPS_HOST}:${VPS_REMOTE_PATH}" "${LOCAL_MOUNT_POINT}" ${SSHFS_OPTS}
 
 if [ $? -eq 0 ]; then
     echo "✓ 挂载成功: ${LOCAL_MOUNT_POINT}"
@@ -136,6 +186,7 @@ EOF
 # 替换变量
 sed -i '' "s|%%VPS_USER%%|${VPS_USER}|g" "${MOUNT_SCRIPT}"
 sed -i '' "s|%%VPS_HOST%%|${VPS_HOST}|g" "${MOUNT_SCRIPT}"
+sed -i '' "s|%%VPS_PEM_KEY%%|${VPS_PEM_KEY:-NONE}|g" "${MOUNT_SCRIPT}"
 sed -i '' "s|%%VPS_REMOTE_PATH%%|${VPS_REMOTE_PATH}|g" "${MOUNT_SCRIPT}"
 sed -i '' "s|%%LOCAL_MOUNT_POINT%%|${LOCAL_MOUNT_POINT}|g" "${MOUNT_SCRIPT}"
 

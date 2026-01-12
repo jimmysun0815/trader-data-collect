@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -265,55 +266,46 @@ class AssetRecorder:
                 ])
                 self.current_file.flush()
     
-    def collect_tick(self):
-        """采集一个tick的数据"""
-        self._check_rotate_file()
-        
-        t0 = time.time()
-        ts = utc_ts()
-        self.sample_id += 1
-        
-        for venue in VENUES:
-            err = ""
-            try:
-                # 根据venue调用对应的fetch函数
-                if venue == "binance_spot":
-                    book = fetch_binance_depth(
-                        self.config["binance_symbol"],
-                        self.limit,
-                        self.timeout_s,
-                        venue
-                    )
-                elif venue == "okx_spot":
-                    book = fetch_okx_books(
-                        self.config["okx_spot"],
-                        self.limit,
-                        self.timeout_s,
-                        venue
-                    )
-                elif venue == "okx_swap":
-                    book = fetch_okx_books(
-                        self.config["okx_swap"],
-                        self.limit,
-                        self.timeout_s,
-                        venue
-                    )
-                elif venue == "bybit_spot":
-                    book = fetch_bybit_books(
-                        "spot",
-                        self.config["bybit_symbol"],
-                        self.limit,
-                        self.timeout_s,
-                        venue
-                    )
-                elif venue == "bybit_linear":
-                    book = fetch_bybit_books(
-                        "linear",
-                        self.config["bybit_symbol"],
-                        self.limit,
-                        self.timeout_s,
-                        venue
-                    )
+    def _fetch_venue(self, venue: str) -> tuple[str, Optional[VenueBook], str]:
+        """获取单个venue的数据（用于并行）"""
+        try:
+            if venue == "binance_spot":
+                book = fetch_binance_depth(
+                    self.config["binance_symbol"],
+                    self.limit,
+                    self.timeout_s,
+                    venue
+                )
+            elif venue == "okx_spot":
+                book = fetch_okx_books(
+                    self.config["okx_spot"],
+                    self.limit,
+                    self.timeout_s,
+                    venue
+                )
+            elif venue == "okx_swap":
+                book = fetch_okx_books(
+                    self.config["okx_swap"],
+                    self.limit,
+                    self.timeout_s,
+                    venue
+                )
+            elif venue == "bybit_spot":
+                book = fetch_bybit_books(
+                    "spot",
+                    self.config["bybit_symbol"],
+                    self.limit,
+                    self.timeout_s,
+                    venue
+                )
+            elif venue == "bybit_linear":
+                book = fetch_bybit_books(
+                    "linear",
+                    self.config["bybit_symbol"],
+                    self.limit,
+                    self.timeout_s,
+                    venue
+                )
                 else:
                     raise ValueError(f"Unknown venue: {venue}")
                 
