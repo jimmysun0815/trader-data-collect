@@ -1,10 +1,12 @@
 [Unit]
 Description=CEX Multi-Asset Order Book Recorder
-After=network.target
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
+User=ubuntu
+Group=ubuntu
 WorkingDirectory=/home/ubuntu/trader-data-collect
 ExecStart=/home/ubuntu/trader-data-collect/venv/bin/python3 /home/ubuntu/trader-data-collect/cex_multi_asset_recorder.py
 
@@ -17,8 +19,8 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=cex-recorder
 
-# 资源限制
-MemoryLimit=512M
+# 资源限制（使用新语法）
+MemoryMax=512M
 CPUQuota=50%
 
 # 环境变量

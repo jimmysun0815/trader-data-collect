@@ -4,6 +4,8 @@ After=network.target
 
 [Service]
 Type=oneshot
+User=ubuntu
+Group=ubuntu
 WorkingDirectory=/home/ubuntu/trader-data-collect
 ExecStart=/home/ubuntu/trader-data-collect/venv/bin/python3 /home/ubuntu/trader-data-collect/archive_old_data.py --days 30 --hot-dir /home/ubuntu/trader-data-collect/real_hot --archive-dir /home/ubuntu/trader-data-collect/real_archive
 StandardOutput=append:/home/ubuntu/trader-data-collect/logs/archive.log
@@ -14,5 +16,5 @@ MemoryMax=512M
 CPUQuota=50%
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 
