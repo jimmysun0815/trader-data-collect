@@ -1,0 +1,30 @@
+[Unit]
+Description=CEX Score Daemon (15m)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/trader-data-collect
+ExecStart=/home/ubuntu/trader-data-collect/venv/bin/python3 /home/ubuntu/trader-data-collect/cex_score_daemon.py --symbol btc --window 15m --port 9001 --hot-dir /home/ubuntu/trader-data-collect/real_hot --output /home/ubuntu/trader-data-collect/real_hot/cex_score_btc_15m.jsonl
+
+# 自动重启
+Restart=always
+RestartSec=10
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cex-score-15m
+
+# 资源限制（使用新语法）
+MemoryMax=512M
+CPUQuota=50%
+
+# 环境变量
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
