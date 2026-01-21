@@ -10,7 +10,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from cex_scorer import AdaptiveScoreNormalizer, _needs_warmup, _normalize_ts
+from cex_scorer import (
+    AdaptiveScoreNormalizer,
+    SignalOptimizer,
+    _fetch_chainlink_history,
+    _needs_warmup,
+    _normalize_ts,
+    _parse_chainlink_nodes,
+    _recent_chainlink_offsets,
+)
 
 
 class IncrementalCexTailReader:
@@ -178,6 +186,48 @@ def _current_slice_path(hot_dir: Path, symbol: str, now_ts: float | None = None)
     return hot_dir / f"cex_{symbol}_{day}_{label}.csv"
 
 
+def _window_start_ts(ts: float, window: str) -> float:
+    if window == "1h":
+        size = 3600
+    else:
+        size = 900
+    return float(int(ts // size) * size)
+
+
+def _score_output_path(*, csv_path: Path, hot_dir: Path, symbol: str, window: str, explicit: str) -> Path:
+    if str(explicit).strip():
+        return Path(explicit)
+    # Match the 12h slice naming: cex_{symbol}_YYYYMMDD_00-12.csv
+    name = csv_path.name
+    parts = name.split("_")
+    day = parts[2] if len(parts) >= 4 else ""
+    label = parts[3].replace(".csv", "") if len(parts) >= 4 else ""
+    if day and label:
+        return hot_dir / f"cex_score_{symbol}_{day}_{label}_{window}.jsonl"
+    return hot_dir / f"cex_score_{symbol}_{window}.jsonl"
+
+
+def _chainlink_cum_change(
+    nodes: list[dict[str, Any]],
+    *,
+    window_start: float,
+    window_end: float,
+) -> float | None:
+    points = _parse_chainlink_nodes(nodes)
+    if not points:
+        return None
+    start_price = None
+    end_price = None
+    for t, p in points:
+        if t <= window_start:
+            start_price = p
+        if t <= window_end:
+            end_price = p
+    if start_price is None or end_price is None:
+        return None
+    return float(abs(end_price - start_price))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="CEX score daemon (incremental, file + TCP).")
     ap.add_argument("--symbol", type=str, default="btc")
@@ -189,14 +239,33 @@ def main() -> int:
     ap.add_argument("--sleep-s", type=float, default=1.0)
     ap.add_argument("--lookback-s", type=int, default=7200)
     ap.add_argument("--min-samples", type=int, default=100)
+    ap.add_argument("--chainlink-feed-id", type=str, default="0x00039d9e45394f473ab1f050a1b963e6b05351e52d71e507509ada0c95ed75b8")
+    ap.add_argument("--chainlink-time-range", type=str, default="1W")
+    ap.add_argument("--chainlink-cache-dir", type=str, default="")
+    ap.add_argument("--chainlink-cache-max-age-s", type=float, default=300.0)
+    ap.add_argument("--decay-T", type=float, default=0.0)
+    ap.add_argument("--decay-lambda-base", type=float, default=0.22)
+    ap.add_argument("--decay-sigma", type=float, default=11.0)
+    ap.add_argument("--decay-multiplier", type=float, default=0.6)
+    ap.add_argument("--decay-min-mu", type=float, default=8.0)
+    ap.add_argument("--decay-max-mu", type=float, default=60.0)
+    ap.add_argument("--decay-N-windows", type=int, default=20)
     args = ap.parse_args()
 
     symbol = str(args.symbol).strip().lower()
     window = str(args.window).strip().lower()
     hot_dir = Path(str(args.hot_dir)).expanduser()
     sleep_s = max(0.1, float(args.sleep_s))
+    decay_T = float(args.decay_T) if float(args.decay_T) > 0 else (60.0 if window == "1h" else 15.0)
+    chainlink_cache_dir = Path(args.chainlink_cache_dir) if args.chainlink_cache_dir else None
 
-    output_path = Path(args.output) if args.output else hot_dir / f"cex_score_{symbol}_{window}.jsonl"
+    output_path = _score_output_path(
+        csv_path=_current_slice_path(hot_dir, symbol),
+        hot_dir=hot_dir,
+        symbol=symbol,
+        window=window,
+        explicit=args.output,
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     cache_dir = Path(".cache")
@@ -239,6 +308,15 @@ def main() -> int:
                 reader = IncrementalCexTailReader(csv_path, venues=venues, weights=weights)
             elif reader.csv_path != csv_path:
                 reader.reset_for_new_file(csv_path)
+                output_path = _score_output_path(
+                    csv_path=csv_path,
+                    hot_dir=hot_dir,
+                    symbol=symbol,
+                    window=window,
+                    explicit=args.output,
+                )
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                print(f"[cex-score] rotate output={output_path}", flush=True)
 
             signal = reader.poll_latest_complete()
             if signal is None:
@@ -249,7 +327,41 @@ def main() -> int:
             normalizer.update(raw_score, t_sample)
             z_score, stats = normalizer.normalize(raw_score, t_sample)
             is_normalized = bool(stats.get("is_normalized"))
-            z_eff = float(z_score) if is_normalized else 0.0
+
+            extra_factor = 1.0
+            mu_val = None
+            offsets_n = 0
+            if is_normalized:
+                nodes = _fetch_chainlink_history(
+                    feed_id=str(args.chainlink_feed_id),
+                    time_range=str(args.chainlink_time_range),
+                    cache_dir=chainlink_cache_dir,
+                    max_age_s=float(args.chainlink_cache_max_age_s),
+                )
+                offsets = _recent_chainlink_offsets(nodes, n_windows=int(args.decay_N_windows))
+                offsets_n = len(offsets)
+                window_start = _window_start_ts(float(t_sample), window)
+                cum_change = _chainlink_cum_change(
+                    nodes,
+                    window_start=window_start,
+                    window_end=float(t_sample),
+                )
+                elapsed_time_min = max(0.0, (float(t_sample) - float(window_start)) / 60.0)
+                if cum_change is not None:
+                    optimizer = SignalOptimizer(
+                        T=float(decay_T),
+                        lambda_base=float(args.decay_lambda_base),
+                        sigma=float(args.decay_sigma),
+                        multiplier=float(args.decay_multiplier),
+                        min_mu=float(args.decay_min_mu),
+                        max_mu=float(args.decay_max_mu),
+                        N_windows=int(args.decay_N_windows),
+                    )
+                    optimizer.set_historical_offsets(offsets)
+                    mu_val = optimizer.compute_dynamic_mu()
+                    extra_factor = optimizer.dynamic_decay(float(elapsed_time_min), float(cum_change))
+
+            z_eff = float(z_score) * float(extra_factor) if is_normalized else 0.0
 
             payload = {
                 "ts": float(_normalize_ts(t_sample)),

@@ -8,7 +8,7 @@ Type=simple
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/trader-data-collect
-ExecStart=/home/ubuntu/trader-data-collect/venv/bin/python3 /home/ubuntu/trader-data-collect/cex_score_daemon.py --symbol btc --window 1h --port 9002 --hot-dir /home/ubuntu/trader-data-collect/real_hot --output /home/ubuntu/trader-data-collect/real_hot/cex_score_btc_1h.jsonl
+ExecStart=/home/ubuntu/trader-data-collect/venv/bin/python3 /home/ubuntu/trader-data-collect/cex_score_daemon.py --symbol btc --window 1h --port 9002 --hot-dir /home/ubuntu/trader-data-collect/real_hot --output /home/ubuntu/trader-data-collect/real_hot/cex_score_btc_1h.jsonl --lookback-s 21600 --decay-T 60
 
 # 自动重启
 Restart=always
