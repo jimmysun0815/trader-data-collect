@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Optional
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 import requests
 
@@ -29,6 +30,14 @@ import requests
 def utc_ts() -> str:
     """返回UTC时间戳字符串"""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _quantile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    values = sorted(values)
+    idx = int(round((len(values) - 1) * float(q)))
+    return float(values[idx])
 
 
 def http_get_json(url: str, *, params: Optional[dict[str, Any]] = None, timeout_s: float = 5.0) -> Any:
@@ -44,6 +53,48 @@ def http_get_json(url: str, *, params: Optional[dict[str, Any]] = None, timeout_
     
     r.raise_for_status()
     return r.json()
+
+
+BINANCE_ENDPOINTS = [
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+]
+
+
+class BinanceEndpointPool:
+    def __init__(self, endpoints: list[str], *, rotate_threshold: int = 101) -> None:
+        self._endpoints = [e.rstrip("/") for e in endpoints if e.strip()]
+        self._rotate_threshold = int(rotate_threshold)
+        self._index = 0
+        self._errors: dict[str, int] = {e: 0 for e in self._endpoints}
+        self._lock = Lock()
+
+    def current_base(self) -> str:
+        with self._lock:
+            if not self._endpoints:
+                return "https://api.binance.com"
+            return self._endpoints[self._index % len(self._endpoints)]
+
+    def record_success(self) -> None:
+        with self._lock:
+            if not self._endpoints:
+                return
+            base = self._endpoints[self._index % len(self._endpoints)]
+            self._errors[base] = 0
+
+    def record_error(self) -> None:
+        with self._lock:
+            if not self._endpoints:
+                return
+            base = self._endpoints[self._index % len(self._endpoints)]
+            self._errors[base] = int(self._errors.get(base, 0)) + 1
+            if self._errors[base] >= self._rotate_threshold:
+                self._errors[base] = 0
+                self._index = (self._index + 1) % len(self._endpoints)
+
+
+_BINANCE_POOL = BinanceEndpointPool(BINANCE_ENDPOINTS, rotate_threshold=101)
 
 
 @dataclass(frozen=True)
@@ -97,11 +148,19 @@ def _microprice(best_bid: float, best_ask: float, bid_qty: float, ask_qty: float
 
 def fetch_binance_depth(symbol: str, limit: int, timeout_s: float, venue: str) -> VenueBook:
     """获取Binance现货depth"""
-    j = http_get_json(
-        "https://api.binance.com/api/v3/depth",
-        params={"symbol": symbol, "limit": str(limit)},
-        timeout_s=timeout_s
-    )
+    base = _BINANCE_POOL.current_base()
+    try:
+        j = http_get_json(
+            f"{base}/api/v3/depth",
+            params={"symbol": symbol, "limit": str(limit)},
+            timeout_s=timeout_s
+        )
+        _BINANCE_POOL.record_success()
+    except requests.HTTPError as exc:
+        status = getattr(exc.response, "status_code", None)
+        if status in (418, 429):
+            _BINANCE_POOL.record_error()
+        raise
     bids = [(float(p), float(q)) for p, q in j.get("bids", [])]
     asks = [(float(p), float(q)) for p, q in j.get("asks", [])]
     
@@ -319,14 +378,18 @@ class AssetRecorder:
                 msg = msg[:240] + "…"
             return venue, None, f"{type(e).__name__}: {msg}"
     
-    def collect_tick(self):
+    def collect_tick(self, *, enable_write: bool = True) -> dict[str, Any]:
         """采集一个tick的数据（并行请求所有venue）"""
-        self._check_rotate_file()
+        if enable_write:
+            self._check_rotate_file()
         
         t0 = time.time()
         ts = utc_ts()
         self.sample_id += 1
         
+        ok = 0
+        total = 0
+        err_rows = 0
         # 并行请求所有venue（最多5个线程）
         with ThreadPoolExecutor(max_workers=len(VENUES)) as executor:
             # 提交所有请求
@@ -338,29 +401,43 @@ class AssetRecorder:
             # 收集结果并写入CSV
             for future in as_completed(futures):
                 venue, book, err = future.result()
-                
+                total += 1
+
                 if book and not err:
-                    # 成功 - 写入完整数据
-                    feats = compute_features(book, self.band_bps)
-                    self.current_writer.writerow([
-                        ts, f"{t0:.6f}", self.sample_id, venue,
-                        book.best_bid, book.best_ask, book.mid, book.spread,
-                        book.bid_qty_l1, book.ask_qty_l1,
-                        feats["bid_notional"], feats["ask_notional"],
-                        feats["imb"], feats["micro"], feats["micro_edge"],
-                        ""
-                    ])
+                    ok += 1
+                    if enable_write:
+                        # 成功 - 写入完整数据
+                        feats = compute_features(book, self.band_bps)
+                        self.current_writer.writerow([
+                            ts, f"{t0:.6f}", self.sample_id, venue,
+                            book.best_bid, book.best_ask, book.mid, book.spread,
+                            book.bid_qty_l1, book.ask_qty_l1,
+                            feats["bid_notional"], feats["ask_notional"],
+                            feats["imb"], feats["micro"], feats["micro_edge"],
+                            ""
+                        ])
                 else:
-                    # 失败 - 写入错误行
-                    self.current_writer.writerow([
-                        ts, f"{t0:.6f}", self.sample_id, venue,
-                        "", "", "", "", "", "",
-                        "", "", "", "", "",
-                        err
-                    ])
+                    err_rows += 1
+                    if enable_write:
+                        # 失败 - 写入错误行
+                        self.current_writer.writerow([
+                            ts, f"{t0:.6f}", self.sample_id, venue,
+                            "", "", "", "", "", "",
+                            "", "", "", "", "",
+                            err
+                        ])
         
         # 刷新到磁盘
-        self.current_file.flush()
+        if enable_write and self.current_file:
+            self.current_file.flush()
+        elapsed = time.time() - t0
+        return {
+            "asset": self.asset,
+            "elapsed_s": float(elapsed),
+            "ok": int(ok),
+            "total": int(total),
+            "err": int(err_rows),
+        }
     
     def close(self):
         """关闭文件"""
@@ -368,45 +445,151 @@ class AssetRecorder:
             self.current_file.close()
 
 
+def _run_benchmark(
+    *,
+    recorders: dict[str, AssetRecorder],
+    executor: ThreadPoolExecutor,
+    hz: float,
+    duration_s: float,
+    log_path: Path,
+) -> dict[str, float]:
+    interval = 1.0 / hz if hz > 0 else 0.0
+    latencies: list[float] = []
+    ok_rates: list[float] = []
+    total_ticks = 0
+    ok_ticks = 0
+    total_rows = 0
+    ok_rows = 0
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", encoding="utf-8") as f:
+        f.write("ts_utc,elapsed_s,ok,total,ok_rate\n")
+        start = time.time()
+        while time.time() - start < duration_s:
+            t0 = time.time()
+            futures = {
+                executor.submit(recorder.collect_tick, enable_write=False): asset
+                for asset, recorder in recorders.items()
+            }
+            ok = 0
+            total = 0
+            for future in as_completed(futures):
+                try:
+                    res = future.result()
+                except Exception:
+                    continue
+                ok += int(res.get("ok") or 0)
+                total += int(res.get("total") or 0)
+            elapsed = time.time() - t0
+            ok_rate = (float(ok) / float(total)) if total > 0 else 0.0
+            f.write(f"{utc_ts()},{elapsed:.6f},{ok},{total},{ok_rate:.4f}\n")
+            f.flush()
+            latencies.append(float(elapsed))
+            ok_rates.append(float(ok_rate))
+            total_ticks += 1
+            if ok_rate >= 0.9:
+                ok_ticks += 1
+            total_rows += total
+            ok_rows += ok
+
+            to_sleep = interval - elapsed
+            if to_sleep > 0:
+                time.sleep(to_sleep)
+
+        summary = {
+            "ticks": float(total_ticks),
+            "ok_tick_ratio": float(ok_ticks / total_ticks) if total_ticks else 0.0,
+            "ok_row_ratio": float(ok_rows / total_rows) if total_rows else 0.0,
+            "p50_s": _quantile(latencies, 0.5),
+            "p90_s": _quantile(latencies, 0.9),
+            "p99_s": _quantile(latencies, 0.99),
+            "avg_ok_rate": sum(ok_rates) / len(ok_rates) if ok_rates else 0.0,
+        }
+        f.write(
+            "summary,"
+            f"ticks={int(summary['ticks'])},"
+            f"ok_tick_ratio={summary['ok_tick_ratio']:.4f},"
+            f"ok_row_ratio={summary['ok_row_ratio']:.4f},"
+            f"p50_s={summary['p50_s']:.4f},"
+            f"p90_s={summary['p90_s']:.4f},"
+            f"p99_s={summary['p99_s']:.4f},"
+            f"avg_ok_rate={summary['avg_ok_rate']:.4f}\n"
+        )
+    return summary
+
+
 def main():
     """主循环"""
-    output_dir = Path(__file__).parent / "real_hot"
-    hz = 1.0  # 每秒采集1次
-    band_bps = 10.0
-    limit = 200
-    timeout_s = 4.0
-    
+    import argparse
+
+    ap = argparse.ArgumentParser(description="CEX multi-asset recorder")
+    ap.add_argument("--output-dir", type=str, default=str(Path(__file__).parent / "real_hot"))
+    ap.add_argument("--hz", type=float, default=1.0, help="target frequency")
+    ap.add_argument("--band-bps", type=float, default=10.0)
+    ap.add_argument("--limit", type=int, default=200)
+    ap.add_argument("--timeout-s", type=float, default=1.0)
+    ap.add_argument("--test-seconds", type=float, default=0.0)
+    ap.add_argument("--log-dir", type=str, default=str(Path(__file__).parent / "log"))
+    args = ap.parse_args()
+
+    output_dir = Path(args.output_dir)
+    hz = float(args.hz)
+    band_bps = float(args.band_bps)
+    limit = int(args.limit)
+    timeout_s = float(args.timeout_s)
+    test_seconds = float(args.test_seconds)
+    log_dir = Path(args.log_dir)
+
     print(f"[INFO] CEX多资产采集器启动", file=sys.stderr)
     print(f"[INFO] 输出目录: {output_dir}", file=sys.stderr)
     print(f"[INFO] 资产: {', '.join(ASSETS.keys())}", file=sys.stderr)
     print(f"[INFO] 采集频率: {hz} Hz", file=sys.stderr)
     print(f"[INFO] 文件切分: 每12小时", file=sys.stderr)
-    
+    print(f"[INFO] timeout_s: {timeout_s}", file=sys.stderr)
+
     # 创建每个资产的采集器
     recorders = {
         asset: AssetRecorder(asset, output_dir, band_bps, limit, timeout_s)
         for asset in ASSETS.keys()
     }
-    
-    interval = 1.0 / hz
-    
+
+    interval = 1.0 / hz if hz > 0 else 0.0
+
     try:
-        while True:
-            t0 = time.time()
-            
-            # 采集所有资产
-            for asset, recorder in recorders.items():
-                try:
-                    recorder.collect_tick()
-                except Exception as e:
-                    print(f"[ERROR] {asset} tick failed: {e}", file=sys.stderr)
-            
-            # 控制采集频率
-            dt = time.time() - t0
-            to_sleep = interval - dt
-            if to_sleep > 0:
-                time.sleep(to_sleep)
-                
+        with ThreadPoolExecutor(max_workers=len(recorders)) as executor:
+            if test_seconds > 0:
+                log_dir.mkdir(parents=True, exist_ok=True)
+                log_path = log_dir / f"cex_benchmark_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
+                summary = _run_benchmark(
+                    recorders=recorders,
+                    executor=executor,
+                    hz=hz if hz > 0 else 1.0,
+                    duration_s=test_seconds,
+                    log_path=log_path,
+                )
+                print(f"[INFO] benchmark_log: {log_path}", file=sys.stderr)
+                print(f"[INFO] benchmark_summary: {summary}", file=sys.stderr)
+                return 0
+
+            while True:
+                t0 = time.time()
+                futures = {
+                    executor.submit(recorder.collect_tick, enable_write=True): asset
+                    for asset, recorder in recorders.items()
+                }
+                for future in as_completed(futures):
+                    asset = futures[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        print(f"[ERROR] {asset} tick failed: {e}", file=sys.stderr)
+
+                # 控制采集频率
+                dt = time.time() - t0
+                to_sleep = interval - dt
+                if to_sleep > 0:
+                    time.sleep(to_sleep)
+
     except KeyboardInterrupt:
         print("\n[INFO] Shutting down...", file=sys.stderr)
     finally:
@@ -414,7 +597,7 @@ def main():
         for asset, recorder in recorders.items():
             recorder.close()
             print(f"[INFO] Closed recorder for {asset}", file=sys.stderr)
-    
+
     print("[INFO] Recorder stopped", file=sys.stderr)
     return 0
 
