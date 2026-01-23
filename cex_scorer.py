@@ -198,6 +198,64 @@ def _warmup_normalizer_from_csv(
     print(f"[cex] warmup: 已补齐样本 {used} 条 (lookback_s={int(lookback_seconds)})", flush=True)
 
 
+def _warmup_normalizer_recursive(
+    *,
+    current_csv: Path,
+    normalizer: AdaptiveScoreNormalizer,
+    venues: list[str],
+    weights: list[float],
+    lookback_seconds: int,
+    now_ts: float,
+    max_files: int = 10,
+) -> None:
+    """
+    递归往前查找多个文件来 warmup normalizer，直到有足够的数据。
+    先尝试当前文件，如果不够就往前找上一个文件，直到满足 warmup 要求或达到最大文件数。
+    """
+    if not current_csv.exists():
+        return
+    
+    # 先尝试从当前文件 warmup
+    try:
+        _warmup_normalizer_from_csv(
+            csv_path=current_csv,
+            normalizer=normalizer,
+            venues=venues,
+            weights=weights,
+            lookback_seconds=lookback_seconds,
+            now_ts=now_ts,
+        )
+    except Exception as e:
+        print(f"[cex] warmup: 当前文件失败 {type(e).__name__}: {e}", flush=True)
+    
+    # 检查是否还需要更多数据
+    files_checked = 1
+    prev_csv = _prev_cex_slice_path(current_csv)
+    while _needs_warmup(normalizer, now_ts=now_ts) and files_checked < max_files:
+        if prev_csv is None or not prev_csv.exists():
+            break
+        try:
+            print(f"[cex] warmup: 数据仍不足，继续从上一个文件加载: {prev_csv.name}", flush=True)
+            _warmup_normalizer_from_csv(
+                csv_path=prev_csv,
+                normalizer=normalizer,
+                venues=venues,
+                weights=weights,
+                lookback_seconds=lookback_seconds,
+                now_ts=now_ts,
+            )
+            files_checked += 1
+            prev_csv = _prev_cex_slice_path(prev_csv)
+        except Exception as e:
+            print(f"[cex] warmup: 上一个文件失败 {type(e).__name__}: {e}", flush=True)
+            break
+    
+    if _needs_warmup(normalizer, now_ts=now_ts):
+        print(f"[cex] warmup: 警告：已检查 {files_checked} 个文件，normalizer history仍不足，z_eff 可能为0直到样本补齐", flush=True)
+    else:
+        print(f"[cex] warmup: 完成，已从 {files_checked} 个文件加载数据", flush=True)
+
+
 @dataclass(frozen=True)
 class CexScoreResult:
     """

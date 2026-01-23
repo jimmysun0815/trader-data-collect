@@ -18,6 +18,7 @@ from cex_scorer import (
     SignalOptimizer,
     _needs_warmup,
     _normalize_ts,
+    _warmup_normalizer_recursive,
 )
 
 
@@ -298,12 +299,12 @@ def main() -> int:
     ap.add_argument("--chainlink-cache-dir", type=str, default="")
     ap.add_argument("--chainlink-cache-max-age-s", type=float, default=300.0)
     ap.add_argument("--decay-T", type=float, default=0.0)
-    ap.add_argument("--decay-lambda-base", type=float, default=0.22)
-    ap.add_argument("--decay-sigma", type=float, default=11.0)
-    ap.add_argument("--decay-multiplier", type=float, default=0.6)
+    ap.add_argument("--decay-lambda-base", type=float, default=0.02)
+    ap.add_argument("--decay-sigma", type=float, default=6.0)
+    ap.add_argument("--decay-multiplier", type=float, default=0.5)
     ap.add_argument("--decay-min-mu", type=float, default=8.0)
     ap.add_argument("--decay-max-mu", type=float, default=60.0)
-    ap.add_argument("--decay-N-windows", type=int, default=20)
+    ap.add_argument("--decay-N-windows", type=int, default=10)
     args = ap.parse_args()
 
     symbol = str(args.symbol).strip().lower()
@@ -333,9 +334,6 @@ def main() -> int:
             min_samples=int(args.min_samples),
         )
 
-    if _needs_warmup(normalizer, now_ts=time.time()):
-        print("[cex-score] warn: normalizer history不足，z_eff 可能为0直到样本补齐", flush=True)
-
     # log decay parameters for debugging
     print(
         f"[cex-score] decay params: T={decay_T:.1f} lambda_base={args.decay_lambda_base:.4f} "
@@ -346,6 +344,29 @@ def main() -> int:
 
     venues = ["binance_spot", "okx_spot", "okx_swap", "bybit_spot", "bybit_linear"]
     weights = [1.0, 1.0, 2.0, 2.0, 3.0]
+
+    # 如果 normalizer 需要 warmup，递归往前查找多个文件来 warmup
+    now_ts = time.time()
+    if _needs_warmup(normalizer, now_ts=now_ts):
+        print("[cex-score] warmup: normalizer history不足，开始递归补齐数据...", flush=True)
+        current_csv = _current_slice_path(hot_dir, symbol, now_ts=now_ts)
+        if current_csv.exists():
+            _warmup_normalizer_recursive(
+                current_csv=current_csv,
+                normalizer=normalizer,
+                venues=venues,
+                weights=weights,
+                lookback_seconds=int(args.lookback_s),
+                now_ts=now_ts,
+                max_files=10,
+            )
+            # 保存 warmup 后的状态
+            try:
+                normalizer.save_state(cache_file)
+            except Exception:
+                pass
+        else:
+            print("[cex-score] warn: 当前 CSV 文件不存在，无法 warmup，z_eff 可能为0直到样本补齐", flush=True)
 
     broadcaster = TcpBroadcaster(args.host, int(args.port))
     broadcaster.start()
