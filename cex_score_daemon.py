@@ -212,10 +212,31 @@ def _fetch_binance_kline_price(
     *,
     ts_ms: int,
     use_open: bool,
+    cache: dict[int, tuple[float, float]] | None = None,
     timeout_s: float = 5.0,
 ) -> float | None:
-    kline_start = int(ts_ms // 60000) * 60000
-    kline_end = int(kline_start + 60000)
+    """
+    获取 Binance 1m kline 价格，支持缓存以减少 API 调用。
+    
+    Args:
+        ts_ms: 时间戳（毫秒）
+        use_open: True 返回开盘价，False 返回收盘价
+        cache: 缓存字典 {minute_key: (open_price, close_price)}，None 表示不使用缓存
+        timeout_s: 请求超时时间
+    
+    Returns:
+        价格，None 表示失败
+    """
+    minute_key = int(ts_ms // 60000)
+    
+    # 检查缓存
+    if cache is not None and minute_key in cache:
+        open_price, close_price = cache[minute_key]
+        return open_price if use_open else close_price
+    
+    # 调用 API 获取数据
+    kline_start = minute_key * 60000
+    kline_end = kline_start + 60000
     params = urllib.parse.urlencode(
         {
             "symbol": "BTCUSDT",
@@ -236,20 +257,35 @@ def _fetch_binance_kline_price(
         return None
     candle = data[0]
     try:
-        return float(candle[1] if use_open else candle[4])
+        open_price = float(candle[1])
+        close_price = float(candle[4])
     except Exception:
         return None
+    
+    # 存入缓存
+    if cache is not None:
+        cache[minute_key] = (open_price, close_price)
+        # 限制缓存大小（保留最近 100 分钟）
+        if len(cache) > 100:
+            oldest_key = min(cache.keys())
+            del cache[oldest_key]
+    
+    return open_price if use_open else close_price
 
 
 def _fetch_binance_price_with_retry(
     *,
     ts_ms: int,
     use_open: bool,
+    cache: dict[int, tuple[float, float]] | None = None,
     max_retries: int = 10,
     sleep_s: float = 1.0,
 ) -> float:
+    """
+    带重试的 Binance 价格获取，支持缓存。
+    """
     for _ in range(max(1, int(max_retries))):
-        price = _fetch_binance_kline_price(ts_ms=ts_ms, use_open=use_open)
+        price = _fetch_binance_kline_price(ts_ms=ts_ms, use_open=use_open, cache=cache)
         if price is not None:
             return float(price)
         time.sleep(float(sleep_s))
@@ -377,6 +413,10 @@ def main() -> int:
     current_window_start: float | None = None
     window_start_price: float | None = None
     last_cum_change: float | None = None
+    
+    # Binance 价格缓存：key=分钟时间戳, value=(open, close)
+    binance_price_cache: dict[int, tuple[float, float]] = {}
+    binance_failure_count = 0  # 失败计数器（用于日志）
 
     print(
         f"[cex-score] start symbol={symbol} window={window} hot_dir={hot_dir} "
@@ -429,6 +469,7 @@ def main() -> int:
                         window_start_price = _fetch_binance_price_with_retry(
                             ts_ms=int(current_window_start * 1000),
                             use_open=True,
+                            cache=binance_price_cache,
                             max_retries=10,
                             sleep_s=1.0,
                         )
@@ -437,12 +478,19 @@ def main() -> int:
                     current_price = _fetch_binance_price_with_retry(
                         ts_ms=int(float(t_sample) * 1000),
                         use_open=False,
+                        cache=binance_price_cache,
                         max_retries=10,
                         sleep_s=1.0,
                     )
                     cum_change = abs(float(current_price) - float(window_start_price))
+                    # 处理 cum_change=0 的情况（窗口刚开始时价格可能未变化）
                     if cum_change <= 0.0:
-                        raise RuntimeError("binance cum_change=0 (invalid)")
+                        if offsets_history:
+                            cum_change = min(offsets_history) * 0.1
+                        else:
+                            cum_change = 0.01  # 默认 1 美分
+                        if binance_failure_count < 3:  # 只在前几次输出警告
+                            print(f"[cex-score] warn: sample_id={sample_id} cum_change=0, using min={cum_change:.4f}", flush=True)
                     last_cum_change = float(cum_change)
                     offsets = list(offsets_history)
                     offsets_n = len(offsets)
@@ -461,8 +509,10 @@ def main() -> int:
                     extra_factor = optimizer.dynamic_decay(float(elapsed_time_min), float(cum_change))
                 except Exception as exc:
                     binance_ok = False
-                    if int(sample_id) % 100 == 0:
-                        print(f"[cex-score] warn: binance price unavailable: {exc}", flush=True)
+                    binance_failure_count += 1
+                    # 详细记录失败原因
+                    if binance_failure_count <= 10 or int(sample_id) % 100 == 0:
+                        print(f"[cex-score] error: sample_id={sample_id} binance_ok=False reason={type(exc).__name__}: {exc}", flush=True)
 
             z_eff = None
             if is_normalized and binance_ok and extra_factor is not None:

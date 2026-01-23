@@ -183,19 +183,28 @@ def _warmup_normalizer_from_csv(
                 rows.append({k: (row.get(k) or "") for k in header})
         signals = _iter_complete_signals_from_rows(rows, venues=venues, weights=weights, min_abs_score=0.0)
     # filter to last lookback window
+    # 如果 last_ts 存在，说明之前已经加载过数据，现在需要加载 [cutoff, last_ts) 范围内的数据来填补空白
+    # 如果 last_ts 不存在，说明是第一次加载，加载 [cutoff, now_s) 范围内的数据
     used = 0
     newest_ts: float | None = None
     for t, s in signals:
         t_s = _normalize_ts(float(t))
         if t_s + 1e-9 < cutoff:
             continue
-        if last_ts is not None and t_s <= float(last_ts) + 1e-9:
-            continue
+        # 如果 last_ts 存在，只加载 [cutoff, last_ts) 范围内的数据（填补空白）
+        # 如果 last_ts 不存在，加载 [cutoff, now_s) 范围内的数据
+        if last_ts is not None:
+            if t_s >= float(last_ts) - 1e-9:
+                continue  # 跳过已经加载过的数据
+        else:
+            if t_s >= float(now_s) - 1e-9:
+                continue  # 跳过未来的数据
         normalizer.update(float(s), float(t_s))
         used += 1
         newest_ts = t_s if newest_ts is None else max(newest_ts, t_s)
     normalizer._cleanup(float(now_s))
-    print(f"[cex] warmup: 已补齐样本 {used} 条 (lookback_s={int(lookback_seconds)})", flush=True)
+    last_ts_str = f"{last_ts:.0f}" if last_ts is not None else "None"
+    print(f"[cex] warmup: 已补齐样本 {used} 条 (lookback_s={int(lookback_seconds)}, cutoff={cutoff:.0f}, last_ts={last_ts_str})", flush=True)
 
 
 def _warmup_normalizer_recursive(
