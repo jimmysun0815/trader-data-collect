@@ -157,9 +157,27 @@ def _warmup_normalizer_from_csv(
     weights: list[float],
     lookback_seconds: int,
     now_ts: float,
+    warmup_end_ts: float | None = None,
 ) -> None:
+    """
+    Warmup normalizer from CSV file.
+    
+    Args:
+        csv_path: CSV file path
+        normalizer: Normalizer to warmup
+        venues: Venue list
+        weights: Weight list
+        lookback_seconds: Lookback window in seconds
+        now_ts: Current timestamp (used to calculate cutoff)
+        warmup_end_ts: Optional end timestamp for warmup data. If None, uses now_ts.
+                      This is useful when warmuping the current file in training,
+                      where we want to include data up to start_t, not now_ts.
+    """
     now_s = _normalize_ts(float(now_ts))
     cutoff = float(now_s) - float(lookback_seconds)
+    # 如果指定了 warmup_end_ts，使用它作为上限；否则使用 now_ts
+    warmup_end = float(warmup_end_ts) if warmup_end_ts is not None else float(now_s)
+    warmup_end = _normalize_ts(warmup_end)
     try:
         last_ts = max((_normalize_ts(t) for t, _ in normalizer.history), default=None)
     except Exception:
@@ -184,7 +202,7 @@ def _warmup_normalizer_from_csv(
         signals = _iter_complete_signals_from_rows(rows, venues=venues, weights=weights, min_abs_score=0.0)
     # filter to last lookback window
     # 如果 last_ts 存在，说明之前已经加载过数据，现在需要加载 [cutoff, last_ts) 范围内的数据来填补空白
-    # 如果 last_ts 不存在，说明是第一次加载，加载 [cutoff, now_s) 范围内的数据
+    # 如果 last_ts 不存在，说明是第一次加载，加载 [cutoff, warmup_end) 范围内的数据
     used = 0
     newest_ts: float | None = None
     for t, s in signals:
@@ -192,19 +210,21 @@ def _warmup_normalizer_from_csv(
         if t_s + 1e-9 < cutoff:
             continue
         # 如果 last_ts 存在，只加载 [cutoff, last_ts) 范围内的数据（填补空白）
-        # 如果 last_ts 不存在，加载 [cutoff, now_s) 范围内的数据
+        # 如果 last_ts 不存在，加载 [cutoff, warmup_end) 范围内的数据
         if last_ts is not None:
             if t_s >= float(last_ts) - 1e-9:
                 continue  # 跳过已经加载过的数据
         else:
-            if t_s >= float(now_s) - 1e-9:
-                continue  # 跳过未来的数据
+            # 如果 warmup_end 指定了，包含 [cutoff, warmup_end] 范围的数据（包含 warmup_end 本身）
+            # 这样训练开始时间 start_t 的数据也会被包含在 warmup 中
+            if t_s > float(warmup_end) + 1e-9:
+                continue  # 跳过 warmup_end 之后的数据（使用 > 而不是 >=，包含 warmup_end 本身）
         normalizer.update(float(s), float(t_s))
         used += 1
         newest_ts = t_s if newest_ts is None else max(newest_ts, t_s)
     normalizer._cleanup(float(now_s))
     last_ts_str = f"{last_ts:.0f}" if last_ts is not None else "None"
-    print(f"[cex] warmup: 已补齐样本 {used} 条 (lookback_s={int(lookback_seconds)}, cutoff={cutoff:.0f}, last_ts={last_ts_str})", flush=True)
+    print(f"[cex] warmup: 已补齐样本 {used} 条 (lookback_s={int(lookback_seconds)}, cutoff={cutoff:.0f}, warmup_end={warmup_end:.0f}, last_ts={last_ts_str})", flush=True)
 
 
 def _warmup_normalizer_recursive(
@@ -216,15 +236,22 @@ def _warmup_normalizer_recursive(
     lookback_seconds: int,
     now_ts: float,
     max_files: int = 10,
+    warmup_end_ts: float | None = None,
 ) -> None:
     """
     递归往前查找多个文件来 warmup normalizer，直到有足够的数据。
     先尝试当前文件，如果不够就往前找上一个文件，直到满足 warmup 要求或达到最大文件数。
+    
+    Args:
+        warmup_end_ts: Optional end timestamp for warmup data. When warmuping the current file,
+                      this should be set to the training start time (start_t), so that data
+                      in [cutoff, start_t) is included. For previous files, this should be None
+                      to use now_ts as the limit.
     """
     if not current_csv.exists():
         return
     
-    # 先尝试从当前文件 warmup
+    # 先尝试从当前文件 warmup（使用 warmup_end_ts 作为上限）
     try:
         _warmup_normalizer_from_csv(
             csv_path=current_csv,
@@ -233,6 +260,7 @@ def _warmup_normalizer_recursive(
             weights=weights,
             lookback_seconds=lookback_seconds,
             now_ts=now_ts,
+            warmup_end_ts=warmup_end_ts,  # 当前文件使用 warmup_end_ts
         )
     except Exception as e:
         print(f"[cex] warmup: 当前文件失败 {type(e).__name__}: {e}", flush=True)
@@ -245,6 +273,7 @@ def _warmup_normalizer_recursive(
             break
         try:
             print(f"[cex] warmup: 数据仍不足，继续从上一个文件加载: {prev_csv.name}", flush=True)
+            # 对于之前的文件，不使用 warmup_end_ts（使用 None，即 now_ts）
             _warmup_normalizer_from_csv(
                 csv_path=prev_csv,
                 normalizer=normalizer,
@@ -252,6 +281,7 @@ def _warmup_normalizer_recursive(
                 weights=weights,
                 lookback_seconds=lookback_seconds,
                 now_ts=now_ts,
+                warmup_end_ts=None,  # 之前的文件使用 now_ts 作为上限
             )
             files_checked += 1
             prev_csv = _prev_cex_slice_path(prev_csv)
