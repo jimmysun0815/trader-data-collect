@@ -1758,22 +1758,26 @@ def score_cex(
     mu_val: Optional[float] = None
     offsets_n = 0
     if use_zeff_model:
-        # v3 MLP zeff: build features, run MLP, inverse_transform if y_scaler (原始量纲 ±0.1)
-        # 确保项目根在 sys.path，以便找到 training 包（daemon 可能从 collect_data 或项目根运行）
+        # v3 MLP zeff: 从模型所在目录加载 zeff_ai_system.py（与 .pth / .scaler.joblib 同目录）
         import sys
-        _cex_dir = Path(__file__).resolve().parent
-        _project_root = _cex_dir.parent if _cex_dir.name == "collect_data" else _cex_dir
-        if str(_project_root) not in sys.path:
-            sys.path.insert(0, str(_project_root))
-        try:
-            from training.zeff_ai_system import ZeffMLP as _ZeffMLP, FEATURES as _ZeffFeatures
-        except ImportError as _e:
-            global _ZEFF_IMPORT_LOGGED
-            if not _ZEFF_IMPORT_LOGGED:
-                print(f"[cex] training.zeff_ai_system import failed: {_e}", flush=True)
-                _ZEFF_IMPORT_LOGGED = True
-            _ZeffMLP = None  # type: ignore[assignment]
-            _ZeffFeatures = _ZEFF_MLP_FEATURES  # type: ignore[assignment]
+        _ZeffMLP = None  # type: ignore[assignment]
+        _ZeffFeatures = _ZEFF_MLP_FEATURES  # type: ignore[assignment]
+        if zeff_model_path:
+            _model_dir = Path(zeff_model_path).resolve().parent
+            _zeff_py = _model_dir / "zeff_ai_system.py"
+            if _zeff_py.exists():
+                _s = str(_model_dir)
+                if _s not in sys.path:
+                    sys.path.insert(0, _s)
+                try:
+                    from zeff_ai_system import ZeffMLP as _ZeffMLP, FEATURES as _ZeffFeatures  # noqa: F811
+                except ImportError as _e:
+                    global _ZEFF_IMPORT_LOGGED
+                    if not _ZEFF_IMPORT_LOGGED:
+                        print(f"[cex] zeff_ai_system import failed (model dir): {_e}", flush=True)
+                        _ZEFF_IMPORT_LOGGED = True
+                    _ZeffMLP = None  # type: ignore[assignment]
+                    _ZeffFeatures = _ZEFF_MLP_FEATURES  # type: ignore[assignment]
         if _ZeffMLP is not None and zeff_model_path:
             path_str = str(Path(zeff_model_path).resolve())
             if path_str not in _ZEFF_MLP_CACHE:
