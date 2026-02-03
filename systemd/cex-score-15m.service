@@ -8,8 +8,7 @@ Type=simple
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/trader-data-collect
-# 使用 cex_score_daemon_v2（已改为从 cex_scorer_v3 导入）；直接运行脚本避免 ModuleNotFoundError: collect_data
-# 启用 MLP zeff：在下面 ExecStart 末尾加 --use-zeff-model（模型路径已硬编码）
+# 必须用 venv 的 python3（MLP 需要 torch/numpy 等）
 ExecStart=/home/ubuntu/trader-data-collect/venv/bin/python3 /home/ubuntu/trader-data-collect/cex_score_daemon_v2.py --symbol btc --window 15m --port 9001 --hot-dir /home/ubuntu/trader-data-collect/real_hot --use-zeff-model
 
 # 自动重启
@@ -25,8 +24,9 @@ SyslogIdentifier=cex-score-15m
 MemoryMax=512M
 CPUQuota=50%
 
-# 环境变量
+# 环境变量：确保使用 venv（PATH 优先 venv/bin，MLP 需 torch/numpy/pandas 等）
 Environment="PYTHONUNBUFFERED=1"
+Environment="PATH=/home/ubuntu/trader-data-collect/venv/bin:/usr/local/bin:/usr/bin:/bin"
 
 [Install]
 WantedBy=multi-user.target

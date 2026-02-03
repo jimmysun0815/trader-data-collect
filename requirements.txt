@@ -7,3 +7,9 @@ web3>=6.0.0
 # Polymarket CLOB客户端（如果需要）
 py-clob-client>=0.1.0
 
+# === CEX score daemon + MLP zeff（cex_scorer_v3 / cex_score_daemon_v2 --use-zeff-model）===
+numpy>=1.21.0
+pandas>=1.3.0
+scikit-learn>=1.0.0
+joblib>=1.1.0
+torch>=2.0.0
