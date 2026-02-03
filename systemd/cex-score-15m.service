@@ -10,7 +10,7 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/trader-data-collect
 # 使用 cex_score_daemon_v2（已改为从 cex_scorer_v3 导入）；直接运行脚本避免 ModuleNotFoundError: collect_data
 # 启用 MLP zeff：在下面 ExecStart 末尾加 --use-zeff-model（模型路径已硬编码）
-ExecStart=/home/ubuntu/trader-data-collect/venv/bin/python3 /home/ubuntu/trader-data-collect/cex_score_daemon_v2.py --symbol btc --window 15m --port 9001 --hot-dir /home/ubuntu/trader-data-collect/real_hot
+ExecStart=/home/ubuntu/trader-data-collect/venv/bin/python3 /home/ubuntu/trader-data-collect/cex_score_daemon_v2.py --symbol btc --window 15m --port 9001 --hot-dir /home/ubuntu/trader-data-collect/real_hot --use-zeff-model
 
 # 自动重启
 Restart=always

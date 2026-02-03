@@ -427,6 +427,7 @@ def main() -> int:
     # Binance 价格缓存：key=分钟时间戳, value=(open, close)
     binance_price_cache: dict[int, tuple[float, float]] = {}
     binance_failure_count = 0  # 失败计数器（用于日志）
+    zeff_zscore_warned = False  # 仅打一次 zeff≈zscore 的 warn
 
     print(
         f"[cex-score] start symbol={symbol} window={window} hot_dir={hot_dir} "
@@ -544,6 +545,9 @@ def main() -> int:
                         z_eff = res.meta.get("z_eff")
                         if hasattr(res, "score"):
                             z_score = float(res.score)
+                        if z_eff is not None and abs(float(z_eff) - float(z_score)) < 1e-6 and not zeff_zscore_warned:
+                            print("[cex-score] warn: MLP may not be applied, zeff≈zscore", flush=True)
+                            zeff_zscore_warned = True
                     else:
                         z_eff = float(res) if res is not None else None
                 except Exception as exc:

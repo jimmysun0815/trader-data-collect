@@ -1814,6 +1814,10 @@ def score_cex(
             extra_factor = zeff / float(normalized_score) if abs(normalized_score) > 1e-9 else 1.0
         else:
             # MLP 未加载则回退到 z_score
+            print(
+                f"[cex] use_zeff_model=True but MLP not used (ZeffMLP={_ZeffMLP is not None}, path={bool(zeff_model_path)}), z_eff=z_score fallback",
+                flush=True,
+            )
             z_eff = float(normalized_score) * float(extra_factor)
     elif elapsed_time_min is not None and cum_change is not None:
         nodes = _fetch_chainlink_history(
