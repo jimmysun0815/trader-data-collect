@@ -2,15 +2,6 @@
 """
 MLP zeff AI: 6 维特征 -> delta_odds_rel (回归)，输出连续 zeff。
 子命令 train / predict；与 zeff_ml_train 共用同一套 train_data 列与 high-acc 逻辑。
-
-用已有 .pth + .scaler.joblib 生成 zeff_predicted_15m.csv（回测用）:
-  从项目根目录:
-    python training/zeff_ai_system.py predict \\
-      --model real_market/trade/model/zeff_mlp_model.pth \\
-      --input-csv training/train_data_15m.csv \\
-      --output-csv training/zeff_predicted_15m.csv
-  scaler 默认与 .pth 同目录同 stem 的 .scaler.joblib，无需单独指定。
-输入 CSV 需含 6 维特征: zscore, raw_score, delta_15s_pct, btc_vol_60s, raw_score_ema, hour_of_day（缺列会填 0）。
 """
 from __future__ import annotations
 
@@ -241,7 +232,7 @@ def _print_eval(y_true: np.ndarray, y_pred: np.ndarray) -> None:
 
 
 def _print_threshold_acc(y_true: np.ndarray, y_pred: np.ndarray) -> None:
-    for th in [0.2, 0.5, 1.0, 1.5]:
+    for th in [0.025, 0.05, 0.1, 0.15, 0.2]:
         mask = np.abs(y_pred) >= th
         n = int(mask.sum())
         if n > 0:
@@ -257,17 +248,21 @@ def _run_shap(model: ZeffMLP, X_val: pd.DataFrame, features: list[str], device: 
     try:
         import shap
         model.eval()
-        background = torch.tensor(X_sub[:100], dtype=torch.float32).to(device)
-        explainer = shap.DeepExplainer(model, background)
-        X_explain = torch.tensor(X_sub[:200], dtype=torch.float32).to(device)
-        shap_vals = explainer.shap_values(X_explain)
-        if isinstance(shap_vals, list):
-            shap_vals = shap_vals[0]
-        if isinstance(shap_vals, torch.Tensor):
-            shap_vals = shap_vals.detach().cpu().numpy()
+        def pred_fn(x):
+            if hasattr(x, "values"):
+                x = x.values
+            x = np.asarray(x, dtype=np.float32)
+            t = torch.tensor(x, dtype=torch.float32).to(device)
+            with torch.no_grad():
+                out = model(t).detach().cpu().numpy().ravel()
+            if y_scaler is not None:
+                out = y_scaler.inverse_transform(out.reshape(-1, 1)).ravel()
+            return out
+        explainer = shap.Explainer(pred_fn, X_sub[:500], feature_names=features)
+        shap_vals = explainer(X_sub[:200])
         print("SHAP summary (feature importance):", flush=True)
         for i, name in enumerate(features):
-            print(f"  {name}: mean |SHAP| = {np.abs(shap_vals[:, i]).mean():.4f}", flush=True)
+            print(f"  {name}: mean |SHAP| = {np.abs(shap_vals.values[:, i]).mean():.4f}", flush=True)
     except Exception as e:
         print(f"SHAP failed: {e}", file=sys.stderr)
 
@@ -361,7 +356,7 @@ def main() -> int:
     t.add_argument("--batch-size", type=int, default=8192, help="Batch size (5070 显存支持 8192)")
     t.add_argument("--lr", type=float, default=0.02, help="Learning rate")
     t.add_argument("--dropout-p", type=float, default=0.3, help="Dropout probability")
-    t.add_argument("--weight-decay", type=float, default=5e-4, help="L2 weight decay (Adam)，建议 5e-4（178k 参数）或 1e-3（强正则）")
+    t.add_argument("--weight-decay", type=float, default=1e-3, help="L2 weight decay (Adam)")
     t.add_argument("--patience", type=int, default=5, help="Early stopping patience (epochs)")
     t.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu", "gpu"], help="Device")
     t.add_argument("--shap", action="store_true", help="Run SHAP after training (validation subset)")
