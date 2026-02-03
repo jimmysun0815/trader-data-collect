@@ -336,13 +336,14 @@ def main() -> int:
     ap.add_argument("--chainlink-time-range", type=str, default="1W")
     ap.add_argument("--chainlink-cache-dir", type=str, default="")
     ap.add_argument("--chainlink-cache-max-age-s", type=float, default=300.0)
-    ap.add_argument("--decay-T", type=float, default=0.0)
-    ap.add_argument("--decay-lambda-base", type=float, default=0.02)
-    ap.add_argument("--decay-sigma", type=float, default=6.0)
-    ap.add_argument("--decay-multiplier", type=float, default=0.5)
+    # 与 cex_scorer_v3 / 回测一致（仅在不使用 MLP 或异常回退时参与 z_eff=z_score*extra_factor）
+    ap.add_argument("--decay-T", type=float, default=0.0, help="0=按 window 自动 15m→15 1h→60")
+    ap.add_argument("--decay-lambda-base", type=float, default=0.22)
+    ap.add_argument("--decay-sigma", type=float, default=11.0)
+    ap.add_argument("--decay-multiplier", type=float, default=0.6)
     ap.add_argument("--decay-min-mu", type=float, default=8.0)
     ap.add_argument("--decay-max-mu", type=float, default=60.0)
-    ap.add_argument("--decay-N-windows", type=int, default=10)
+    ap.add_argument("--decay-N-windows", type=int, default=20)
     ap.add_argument("--use-zeff-model", action="store_true", help="use v3 MLP model for z_eff (default path hardcoded in collect_data)")
     ap.add_argument("--zeff-model-path", type=str, default="", help="path to zeff MLP .pth (default: hardcoded /home/ubuntu/trader-data-collect/model/zeff_mlp_model.pth)")
     args = ap.parse_args()
@@ -380,7 +381,8 @@ def main() -> int:
             min_samples=int(args.min_samples),
         )
 
-    # log decay parameters for debugging
+    # log decay parameters（仅在不使用 MLP 时参与 z_eff=z_score*extra_factor；使用 MLP 时仅用于异常回退）
+    # T=窗口时长(分钟) lambda_base=衰减率 sigma=过渡宽度 multiplier/min_mu/max_mu=SignalOptimizer 参数 N_windows=历史窗口数
     print(
         f"[cex-score] decay params: T={decay_T:.1f} lambda_base={args.decay_lambda_base:.4f} "
         f"sigma={args.decay_sigma:.1f} multiplier={args.decay_multiplier:.2f} "

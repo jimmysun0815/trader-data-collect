@@ -9,7 +9,7 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/trader-data-collect
 # 必须用 venv 的 python3（MLP 需要 torch/numpy 等）
-ExecStart=/home/ubuntu/trader-data-collect/venv/bin/python3 /home/ubuntu/trader-data-collect/cex_score_daemon_v2.py --symbol btc --window 15m --port 9001 --hot-dir /home/ubuntu/trader-data-collect/real_hot --use-zeff-model
+ExecStart=/home/ubuntu/trader-data-collect/venv/bin/python3 /home/ubuntu/trader-data-collect/cex_score_daemon_v2.py --symbol btc --window 15m --port 9001 --hot-dir /home/ubuntu/trader-data-collect/real_hot --decay-T 15 --decay-lambda-base 0.22 --decay-sigma 11 --decay-multiplier 0.6 --decay-min-mu 8 --decay-max-mu 60 --decay-N-windows 20 --use-zeff-model
 
 # 自动重启
 Restart=always
