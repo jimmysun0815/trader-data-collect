@@ -36,6 +36,8 @@ _EWMA_LOCKS: dict[str, threading.Lock] = {}  # cache_key -> Lock，多线程下�
 _LAST_BTC_MID: dict[str, float] = {}  # cache_key -> last known btc_mid (live fallback when mid_series empty)
 _ZEFF_MLP_CACHE: dict[str, Any] = {}  # zeff_model_path -> (model, scaler, y_scaler, features, hidden_sizes)
 _LOGGED_MLP_LOAD: set[str] = set()  # zeff_model_path 已打过 "MLP model loaded" 日志，防刷屏
+_ZEFF_IMPORT_LOGGED: bool = False  # 仅打一次 import 失败日志
+_ZEFF_FALLBACK_LOGGED: bool = False  # 仅打一次 MLP not used fallback 日志
 # 默认模型路径（collect_data 内硬编码，部署目录）
 DEFAULT_ZEFF_MODEL_PATH = "/home/ubuntu/trader-data-collect/model/zeff_mlp_model.pth"
 
@@ -1757,9 +1759,19 @@ def score_cex(
     offsets_n = 0
     if use_zeff_model:
         # v3 MLP zeff: build features, run MLP, inverse_transform if y_scaler (原始量纲 ±0.1)
+        # 确保项目根在 sys.path，以便找到 training 包（daemon 可能从 collect_data 或项目根运行）
+        import sys
+        _cex_dir = Path(__file__).resolve().parent
+        _project_root = _cex_dir.parent if _cex_dir.name == "collect_data" else _cex_dir
+        if str(_project_root) not in sys.path:
+            sys.path.insert(0, str(_project_root))
         try:
             from training.zeff_ai_system import ZeffMLP as _ZeffMLP, FEATURES as _ZeffFeatures
-        except ImportError:
+        except ImportError as _e:
+            global _ZEFF_IMPORT_LOGGED
+            if not _ZEFF_IMPORT_LOGGED:
+                print(f"[cex] training.zeff_ai_system import failed: {_e}", flush=True)
+                _ZEFF_IMPORT_LOGGED = True
             _ZeffMLP = None  # type: ignore[assignment]
             _ZeffFeatures = _ZEFF_MLP_FEATURES  # type: ignore[assignment]
         if _ZeffMLP is not None and zeff_model_path:
@@ -1814,10 +1826,13 @@ def score_cex(
             extra_factor = zeff / float(normalized_score) if abs(normalized_score) > 1e-9 else 1.0
         else:
             # MLP 未加载则回退到 z_score
-            print(
-                f"[cex] use_zeff_model=True but MLP not used (ZeffMLP={_ZeffMLP is not None}, path={bool(zeff_model_path)}), z_eff=z_score fallback",
-                flush=True,
-            )
+            global _ZEFF_FALLBACK_LOGGED
+            if not _ZEFF_FALLBACK_LOGGED:
+                print(
+                    f"[cex] use_zeff_model=True but MLP not used (ZeffMLP={_ZeffMLP is not None}, path={bool(zeff_model_path)}), z_eff=z_score fallback",
+                    flush=True,
+                )
+                _ZEFF_FALLBACK_LOGGED = True
             z_eff = float(normalized_score) * float(extra_factor)
     elif elapsed_time_min is not None and cum_change is not None:
         nodes = _fetch_chainlink_history(
