@@ -1826,7 +1826,6 @@ def score_cex(
                 zeff = float(y_scaler.inverse_transform([[zeff_scaled]])[0][0])
             else:
                 zeff = float(zeff_scaled)
-            zeff = max(-zeff_clip, min(zeff, zeff_clip))
             z_eff = zeff
             extra_factor = zeff / float(normalized_score) if abs(normalized_score) > 1e-9 else 1.0
         else:
