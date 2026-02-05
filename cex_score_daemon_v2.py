@@ -478,7 +478,7 @@ def main() -> int:
                     window_start = _window_start_ts(float(t_sample), window)
                     if current_window_start is None or window_start != current_window_start:
                         if last_cum_change is not None:
-                            offsets_history.append(float(last_cum_change))
+                            offsets_history.append(abs(float(last_cum_change)))  # 历史记录用绝对值
                         current_window_start = float(window_start)
                         window_start_price = _fetch_binance_price_with_retry(
                             ts_ms=int(current_window_start * 1000),
@@ -496,15 +496,15 @@ def main() -> int:
                         max_retries=10,
                         sleep_s=1.0,
                     )
-                    cum_change = abs(float(current_price) - float(window_start_price))
+                    cum_change = float(current_price) - float(window_start_price)  # 带符号（去掉abs）
                     # 处理 cum_change=0 的情况（窗口刚开始时价格可能未变化）
-                    if cum_change <= 0.0:
+                    if abs(cum_change) <= 1e-9:
                         if offsets_history:
                             cum_change = min(offsets_history) * 0.1
                         else:
                             cum_change = 0.01  # 默认 1 美分
                         if binance_failure_count < 3:  # 只在前几次输出警告
-                            print(f"[cex-score] warn: sample_id={sample_id} cum_change=0, using min={cum_change:.4f}", flush=True)
+                            print(f"[cex-score] warn: sample_id={sample_id} cum_change≈0, using min={cum_change:.4f}", flush=True)
                     last_cum_change = float(cum_change)
                     offsets = list(offsets_history)
                     offsets_n = len(offsets)
@@ -531,6 +531,10 @@ def main() -> int:
             z_eff = None
             if use_zeff_model:
                 try:
+                    # 计算窗口特征
+                    elapsed_seconds = elapsed_time_min * 60.0 if elapsed_time_min is not None else None
+                    cum_change_abs = cum_change if cum_change is not None else None
+                    
                     res = score_cex_v3(
                         csv_path,
                         venues=venues,
@@ -542,6 +546,8 @@ def main() -> int:
                         return_meta=True,
                         use_zeff_model=True,
                         zeff_model_path=zeff_model_path or None,
+                        elapsed_seconds=elapsed_seconds,
+                        cum_change_abs=cum_change_abs,
                     )
                     if hasattr(res, "meta") and res.meta is not None:
                         z_eff = res.meta.get("z_eff")

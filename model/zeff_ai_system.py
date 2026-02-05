@@ -2,6 +2,20 @@
 """
 MLP zeff AI: 6 维特征 -> delta_odds_rel (回归)，输出连续 zeff。
 子命令 train / predict；与 zeff_ml_train 共用同一套 train_data 列与 high-acc 逻辑。
+
+新特征方案（6个）：
+  - zscore, raw_score, btc_vol_60s, raw_score_ema (保留的4个)
+  - elapsed_seconds_in_window (0-900秒，窗口内位置)
+  - cum_change_abs (美元，窗口开始到当前的BTC价格绝对变化)
+
+用已有 .pth + .scaler.joblib 生成 zeff_predicted_15m.csv（回测用）:
+  从项目根目录:
+    python training/zeff_ai_system.py predict \\
+      --model real_market/trade/model/zeff_mlp_model.pth \\
+      --input-csv training/train_data_15m.csv \\
+      --output-csv training/zeff_predicted_15m.csv
+  scaler 默认与 .pth 同目录同 stem 的 .scaler.joblib，无需单独指定。
+输入 CSV 需含 6 维特征（缺列会填 0）。
 """
 from __future__ import annotations
 
@@ -15,8 +29,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-# 固定 6 维特征（含 hour_of_day，由 t_unix 推导）
-FEATURES = ["zscore", "raw_score", "delta_15s_pct", "btc_vol_60s", "raw_score_ema", "hour_of_day"]
+# 固定 6 维特征（新特征方案：保留4个 + 新增2个窗口特征）
+FEATURES = ["zscore", "raw_score", "btc_vol_60s", "raw_score_ema", "elapsed_seconds_in_window", "cum_change_abs"]
 TARGET_REG = "delta_odds_rel"
 HIGH_ACC_HOURS_UTC = {0, 3, 4, 5, 6, 7, 12, 13, 19, 20, 23}
 
@@ -72,8 +86,7 @@ def _prepare_data(
     df = df.dropna(subset=["zscore", TARGET_REG]).copy()
     df["zscore"] = df["zscore"].clip(*clip_zscore)
     df[TARGET_REG] = df[TARGET_REG].clip(*clip_target)
-    if "hour_of_day" not in df.columns and "t_unix" in df.columns:
-        df["hour_of_day"] = pd.to_datetime(df["t_unix"], unit="s", errors="coerce").dt.hour
+    # 确保所有特征列存在，缺失的填0
     for c in FEATURES:
         if c not in df.columns:
             df[c] = 0.0

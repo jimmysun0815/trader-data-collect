@@ -1,78 +1,54 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
-import os
 import pickle
+import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
 import statistics
-import threading
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
+logger = logging.getLogger(__name__)
+
 try:
-    from scipy.stats import spearmanr as _spearmanr
     from scipy.stats import trim_mean as _trim_mean
 except ImportError:
-    _spearmanr = None  # type: ignore[assignment]
     _trim_mean = None  # type: ignore[assignment]
 
+try:
+    from scipy.stats import bootstrap as _scipy_bootstrap
+except ImportError:
+    _scipy_bootstrap = None  # type: ignore[assignment]
+
+try:
+    from scipy.stats import spearmanr as _scipy_spearmanr
+except ImportError:
+    _scipy_spearmanr = None  # type: ignore[assignment]
+
 _NORMALIZER_CACHE: dict[str, AdaptiveScoreNormalizer] = {}
-_ZEFF_CALC_CACHE: dict[str, ZeffCalculator] = {}
 _LOGGED_NORMALIZER: set[str] = set()
-_LOGGED_VOL_FALLBACK: set[int] = set()  # id(normalizer) 已打过 vol fallback 日志，防刷屏
 _LOGGED_CSV: set[str] = set()
-_LOGGED_MID_EMPTY: set[str] = set()  # cache_key 已打过 current_mid 为空且 use_vol_norm 的日志，防刷屏
-_LOGGED_MID_SERIES_EMPTY: set[str] = set()  # cache_key 已打过 mid_series empty 的日志，防刷屏
+_LOGGED_VOL_FALLBACK: set[int] = set()
+_LOGGED_MID_EMPTY: set[str] = set()
+_LOGGED_MID_SERIES_EMPTY: set[str] = set()
 _WARMUP_DONE: set[str] = set()
+_TS_WARNED: set[float] = set()  # 异常时间戳只告警一次
 _CHAINLINK_CACHE: dict[str, dict[str, Any]] = {}
-_EWMA_STATE: dict[str, float] = {}  # cache_key -> ewma_raw
-_EWMA_LOCKS: dict[str, threading.Lock] = {}  # cache_key -> Lock，多线程下读写 EWMA 与 pkl 时加锁
-_LAST_BTC_MID: dict[str, float] = {}  # cache_key -> last known btc_mid (live fallback when mid_series empty)
-_ZEFF_MLP_CACHE: dict[str, Any] = {}  # zeff_model_path -> (model, scaler, y_scaler, features, hidden_sizes)
-_LOGGED_MLP_LOAD: set[str] = set()  # zeff_model_path 已打过 "MLP model loaded" 日志，防刷屏
-_ZEFF_IMPORT_LOGGED: bool = False  # 仅打一次 import 失败日志
-_ZEFF_FALLBACK_LOGGED: bool = False  # 仅打一次 MLP not used fallback 日志
-# 默认模型路径（collect_data 内硬编码，部署目录）
-DEFAULT_ZEFF_MODEL_PATH = "/home/ubuntu/trader-data-collect/model/zeff_mlp_model.pth"
-
-
-def _ewma_lock(cache_key: str) -> threading.Lock:
-    """按 cache_key 懒加载 Lock，用于 EWMA 读写与 pkl 的线程安全。"""
-    if cache_key not in _EWMA_LOCKS:
-        _EWMA_LOCKS[cache_key] = threading.Lock()
-    return _EWMA_LOCKS[cache_key]
-
-
-def _load_ewma_state(ewma_file: Path) -> Optional[float]:
-    """从 pkl 加载 EWMA 状态；文件不存在或损坏返回 None。"""
-    if not ewma_file.exists():
-        return None
-    try:
-        with ewma_file.open("rb") as f:
-            state = pickle.load(f)
-        ewma_raw = state.get("ewma_raw")
-        if ewma_raw is None:
-            return None
-        return float(ewma_raw)
-    except Exception:
-        return None
-
-
-def _save_ewma_state(ewma_file: Path, ewma_raw: float) -> None:
-    """将 EWMA 状态写入 pkl。"""
-    try:
-        ewma_file.parent.mkdir(parents=True, exist_ok=True)
-        state = {"ewma_raw": float(ewma_raw), "saved_at": time.time()}
-        with ewma_file.open("wb") as f:
-            pickle.dump(state, f)
-    except Exception:
-        pass  # 保存失败不影响返回结果
+_EWMA_STATE: dict[str, float] = {}
+_EWMA_LOCKS: dict[str, threading.Lock] = {}
+_consecutive_failures: int = 0
+_binance_failed_since: Optional[float] = None
+_BINANCE_OFFSETS_CACHE: dict[str, tuple[float, list[float]]] = {}
+_BINANCE_OHLCV_DEQUE: Optional[deque] = None
+_BINANCE_DEQUE_MAXLEN: int = 48
 
 
 def _read_csv_header(path: Path) -> list[str]:
@@ -116,14 +92,14 @@ def _iter_complete_signals_from_rows(
     need = set(venues)
     groups: dict[int, dict[str, Any]] = {}
     for row in rows:
-        venue = (row.get("venue") or "").strip()
+        venue = str(row.get("venue") or "").strip()
         if venue not in need:
             continue
-        if (row.get("err") or "").strip():
+        if str(row.get("err") or "").strip():
             continue
-        sid_s = (row.get("sample_id") or "").strip()
-        t_s = (row.get("t_sample_unix") or "").strip()
-        imb_s = (row.get("imb") or "").strip()
+        sid_s = str(row.get("sample_id") or "").strip()
+        t_s = str(row.get("t_sample_unix") or "").strip()
+        imb_s = str(row.get("imb") or "").strip()
         if not (sid_s and t_s and imb_s):
             continue
         try:
@@ -151,25 +127,75 @@ def _iter_complete_signals_from_rows(
     return out
 
 
-def _mid_series_from_rows(
+def _ewma_lock(cache_key: str) -> threading.Lock:
+    """按 cache_key 懒加载 Lock，用于 EWMA 读写与 pkl 的线程安全。"""
+    if cache_key not in _EWMA_LOCKS:
+        _EWMA_LOCKS[cache_key] = threading.Lock()
+    return _EWMA_LOCKS[cache_key]
+
+
+def _load_ewma_state(ewma_file: Path) -> Optional[float]:
+    """从 pkl 加载 EWMA 状态；文件不存在或损坏返回 None。"""
+    if not ewma_file.exists():
+        return None
+    try:
+        with ewma_file.open("rb") as f:
+            state = pickle.load(f)
+        ewma_raw = state.get("ewma_raw")
+        if ewma_raw is None:
+            return None
+        return float(ewma_raw)
+    except Exception:
+        return None
+
+
+def _save_ewma_state(ewma_file: Path, ewma_raw: float) -> None:
+    """将 EWMA 状态写入 pkl。"""
+    try:
+        ewma_file.parent.mkdir(parents=True, exist_ok=True)
+        state = {"ewma_raw": float(ewma_raw), "saved_at": time.time()}
+        with ewma_file.open("wb") as f:
+            pickle.dump(state, f)
+    except Exception:
+        pass
+
+
+def cleanup_old_ewma(cache_dir: Path, max_files: int = 50) -> None:
+    """删除过旧的 cex_normalizer_*_ewma.pkl，保留最新 max_files 个。"""
+    try:
+        cache_dir = Path(cache_dir)
+        if not cache_dir.exists():
+            return
+        files = list(cache_dir.glob("cex_normalizer_*_ewma.pkl"))
+        if len(files) <= max_files:
+            return
+        files.sort(key=lambda p: p.stat().st_mtime)
+        for old in files[:-max_files]:
+            try:
+                old.unlink()
+                logger.info("Cleaned old EWMA file: %s", old)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def v3_mid_series_from_rows(
     rows: list[dict[str, str]],
     mid_venue: str,
 ) -> list[tuple[float, float]]:
-    """
-    从 rows 中提取指定 venue 的 (t, mid) 序列，按 sample_id 去重（每 sample 取一条）。
-    用于波动率计算。
-    """
+    """从 rows 中提取指定 venue 的 (t, mid) 序列，按 sample_id 去重。用于波动率计算。"""
     out: list[tuple[float, float]] = []
     seen_sid: set[int] = set()
     for row in rows:
-        venue = (row.get("venue") or "").strip()
+        venue = str(row.get("venue") or "").strip()
         if venue != mid_venue:
             continue
-        if (row.get("err") or "").strip():
+        if str(row.get("err") or "").strip():
             continue
-        sid_s = (row.get("sample_id") or "").strip()
-        t_s = (row.get("t_sample_unix") or "").strip()
-        mid_s = (row.get("mid") or "").strip()
+        sid_s = str(row.get("sample_id") or "").strip()
+        t_s = str(row.get("t_sample_unix") or "").strip()
+        mid_s = str(row.get("mid") or "").strip()
         if not (sid_s and t_s and mid_s):
             continue
         try:
@@ -186,7 +212,7 @@ def _mid_series_from_rows(
     return out
 
 
-def apply_volatility_filter(
+def v3_apply_volatility_filter(
     rows: list[dict[str, str]],
     raw_score: float,
     mid_venue: str,
@@ -198,28 +224,21 @@ def apply_volatility_filter(
     use_atr: bool = False,
     vol_extreme_zero: bool = False,
 ) -> float:
-    """
-    当当前窗口波动率高于历史阈值时，对 raw_score 做衰减或置零。
-    - 波动率：std(mid) 或 ATR(mid)；阈值 = 历史滚动 window 波动率中位数 * multiplier。
-    - 若 current_vol > threshold：extreme 时返回 0，否则 raw_score * decay_factor。
-    """
-    mid_series = _mid_series_from_rows(rows, mid_venue)
+    """当当前窗口波动率高于历史阈值时，对 raw_score 做衰减或置零。"""
+    mid_series = v3_mid_series_from_rows(rows, mid_venue)
     if len(mid_series) < 2:
         return raw_score
     now_ts = mid_series[-1][0] if mid_series else 0.0
     cutoff_hist = now_ts - hist_window_sec
-    # 只用历史窗口内的点
     in_hist = [(t, m) for t, m in mid_series if t >= cutoff_hist]
     if len(in_hist) < 2:
         return raw_score
     mids = [m for _, m in in_hist]
-    # 当前窗口：最近 window_sec
     cutoff_cur = now_ts - window_sec
     cur_mids = [m for t, m in in_hist if t >= cutoff_cur]
     if len(cur_mids) < 2:
         return raw_score
     if use_atr:
-        # ATR on mid: TR = |mid - prev_mid|, ATR = EMA(TR)
         trs_cur = []
         for i in range(1, len(cur_mids)):
             trs_cur.append(abs(cur_mids[i] - cur_mids[i - 1]))
@@ -230,7 +249,6 @@ def apply_volatility_filter(
         for i in range(1, len(trs_cur)):
             ema_tr = (2.0 / (span + 1)) * trs_cur[i] + (1.0 - 2.0 / (span + 1)) * ema_tr
         current_vol = ema_tr
-        # 历史 ATR：滚动窗口内 EMA(TR)，取中位数
         hist_vols = []
         w = max(2, int(window_sec))
         for start in range(len(mids) - w):
@@ -247,7 +265,6 @@ def apply_volatility_filter(
         historical_vol = statistics.median(hist_vols) if hist_vols else current_vol
     else:
         current_vol = statistics.stdev(cur_mids)
-        # 历史：滚动 window_sec 的 std 的中位数
         hist_vols = []
         n = len(mids)
         w = max(2, int(window_sec))
@@ -266,24 +283,21 @@ def apply_volatility_filter(
     return raw_score
 
 
-def _venue_series_from_rows(
+def v3_venue_series_from_rows(
     rows: list[dict[str, str]],
     venues: list[str],
 ) -> dict[str, list[tuple[float, float, float]]]:
-    """
-    从 rows 中按 venue 提取 (t, imb, mid) 序列，每 venue 一个列表，按 t 升序。
-    用于动态权重计算（需再补 delta_mid：backtest 用未来，live 用 delayed）。
-    """
+    """从 rows 中按 venue 提取 (t, imb, mid) 序列，每 venue 一个列表，按 t 升序。"""
     out: dict[str, list[tuple[float, float, float]]] = {v: [] for v in venues}
     for row in rows:
-        venue = (row.get("venue") or "").strip()
+        venue = str(row.get("venue") or "").strip()
         if venue not in out:
             continue
-        if (row.get("err") or "").strip():
+        if str(row.get("err") or "").strip():
             continue
-        t_s = (row.get("t_sample_unix") or "").strip()
-        imb_s = (row.get("imb") or "").strip()
-        mid_s = (row.get("mid") or "").strip()
+        t_s = str(row.get("t_sample_unix") or "").strip()
+        imb_s = str(row.get("imb") or "").strip()
+        mid_s = str(row.get("mid") or "").strip()
         if not (t_s and imb_s and mid_s):
             continue
         try:
@@ -298,7 +312,7 @@ def _venue_series_from_rows(
     return out
 
 
-def compute_dynamic_weights(
+def v3_compute_dynamic_weights(
     venue_data: dict[str, list[tuple[float, float, Optional[float]]]],
     *,
     window_sec: float = 60.0,
@@ -307,42 +321,34 @@ def compute_dynamic_weights(
     use_spearman: bool = True,
     base_weights: Optional[dict[str, float]] = None,
 ) -> dict[str, float]:
-    """
-    根据各 venue 最近 window_sec 内 (imb, delta_mid) 的置信度（Spearman 或 sign-match）
-    计算权重：weight_v = base_v * (1 + k * (conf_v - median_conf))，clip [0.5, 1.5]。
-    venue_data[v] = [(t, imb, delta_mid), ...]，delta_mid 为 None 的样本不参与 corr。
-    若所有 venue 置信度都 NaN/不足，fallback 为 equal weights 或 base_weights。
-    """
+    """根据各 venue 最近 window_sec 内 (imb, delta_mid) 的置信度计算动态权重。"""
     need = list(venue_data.keys())
     if not need:
         return {}
     confidences: dict[str, float] = {}
     for venue in need:
         series = venue_data.get(venue) or []
-        # 取最近 window_sec 内且 delta_mid 非 None 的点
         cutoff = 0.0
         if series:
             cutoff = series[-1][0] - window_sec
         pairs = [(imb, dm) for t, imb, dm in series if t >= cutoff and dm is not None]
         if len(pairs) < min_samples:
-            confidences[venue] = 0.5  # 默认中性
+            confidences[venue] = 0.5
             continue
         imbs = [p[0] for p in pairs]
         deltas = [p[1] for p in pairs]
-        if use_spearman and _spearmanr is not None:
+        if use_spearman and _scipy_spearmanr is not None:
             try:
-                corr, _ = _spearmanr(imbs, deltas)
-                conf = float(corr) if not (corr != corr) else 0.0  # NaN -> 0
+                corr, _ = _scipy_spearmanr(imbs, deltas)
+                conf = float(corr) if not (corr != corr) else 0.0
             except Exception:
                 conf = 0.0
         else:
-            # Sign 一致率
             match = sum(1 for a, b in zip(imbs, deltas) if (a > 0 and b > 0) or (a < 0 and b < 0) or (a == 0 and b == 0))
             conf = match / len(pairs) if pairs else 0.0
         confidences[venue] = conf
     vals = [confidences[v] for v in need]
     median_conf = statistics.median(vals) if vals else 0.0
-    # Fallback: 若全部为默认中性或不可用，用 equal 或 base_weights
     if base_weights is not None:
         default_weights = {v: float(base_weights.get(v, 1.0)) for v in need}
     else:
@@ -357,7 +363,7 @@ def compute_dynamic_weights(
     return weights
 
 
-def compute_weighted_score_at_t(
+def v3_compute_weighted_score_at_t(
     venue_imbs: dict[str, float],
     weights: dict[str, float],
 ) -> float:
@@ -373,7 +379,7 @@ def compute_weighted_score_at_t(
     return total / total_w
 
 
-def load_recent_signals(
+def v3_load_recent_signals(
     path: Path,
     venues: list[str],
     weights: list[float],
@@ -382,20 +388,7 @@ def load_recent_signals(
     min_abs_score: float = 0.1,
     tail_bytes: int = 16384,
 ) -> list[tuple[float, float]]:
-    """
-    从CSV文件加载最近时间窗口内的所有完整信号。
-    
-    Args:
-        path: CSV文件路径
-        venues: 交易所列表
-        weights: 对应的权重列表
-        time_window_sec: 滚动窗口秒数，默认30.0
-        min_abs_score: 弱信号过滤阈值，默认0.1
-        tail_bytes: 读取CSV尾部的字节数，默认16384
-    
-    Returns:
-        按时间升序排序的 (timestamp, score) 列表
-    """
+    """从CSV文件加载最近时间窗口内的所有完整信号（固定权重）。"""
     rows = _read_tail_rows(path, tail_bytes=tail_bytes)
     all_signals = _iter_complete_signals_from_rows(
         rows, venues=venues, weights=weights, min_abs_score=min_abs_score
@@ -407,10 +400,10 @@ def load_recent_signals(
         for t, s in all_signals
         if _normalize_ts(float(t)) >= cutoff_ts and abs(float(s)) >= float(min_abs_score)
     ]
-    return sorted(recent, key=lambda x: x[0])  # 按 t 升序
+    return sorted(recent, key=lambda x: x[0])
 
 
-def load_recent_signals_with_dynamic_weights(
+def v3_load_recent_signals_with_dynamic_weights(
     path: Path,
     venues: list[str],
     *,
@@ -424,49 +417,42 @@ def load_recent_signals_with_dynamic_weights(
     dw_use_spearman: bool = True,
     base_weights: Optional[dict[str, float]] = None,
 ) -> list[tuple[float, float]]:
-    """
-    使用动态 venue 权重加载最近时间窗口内的信号：每 t 用历史 (imb, delta_mid) 算权重，再加权聚合。
-    Live 下 delta_mid 用 delayed 近似（t+horizon 用当前最新 mid）。
-    """
+    """使用动态 venue 权重加载最近时间窗口内的信号。"""
     rows = _read_tail_rows(path, tail_bytes=tail_bytes)
-    venue_series = _venue_series_from_rows(rows, venues)
+    venue_series = v3_venue_series_from_rows(rows, venues)
     need = set(venues)
-    # now_ts = 数据中最大 t
     now_ts = 0.0
     for v in venues:
         for t, _, _ in venue_series.get(v) or []:
             now_ts = max(now_ts, float(t))
     if now_ts <= 0:
         now_ts = time.time()
-    # 每个 venue 的 latest mid（用于 delayed delta_mid）
     latest_mid: dict[str, float] = {}
     for v in venues:
         ser = venue_series.get(v) or []
         if ser:
-            latest_mid[v] = ser[-1][2]  # mid at last t
+            latest_mid[v] = ser[-1][2]
         else:
             latest_mid[v] = 0.0
-    # 构建 (t, imb, delta_mid)，live 下 delta_mid = latest_mid - mid 当 t+horizon <= now_ts
     venue_data: dict[str, list[tuple[float, float, Optional[float]]]] = {}
     for v in venues:
         ser = venue_series.get(v) or []
-        out: list[tuple[float, float, Optional[float]]] = []
+        out_list: list[tuple[float, float, Optional[float]]] = []
         for t, imb, mid in ser:
             if t + dw_horizon_sec <= now_ts:
                 delta_mid = latest_mid[v] - mid
             else:
                 delta_mid = None
-            out.append((t, imb, delta_mid))
-        venue_data[v] = out
-    # 完整 sample (t, {venue: imb})
+            out_list.append((t, imb, delta_mid))
+        venue_data[v] = out_list
     groups: dict[int, dict[str, Any]] = {}
     for row in rows:
-        venue = (row.get("venue") or "").strip()
-        if venue not in need or (row.get("err") or "").strip():
+        venue = str(row.get("venue") or "").strip()
+        if venue not in need or str(row.get("err") or "").strip():
             continue
-        sid_s = (row.get("sample_id") or "").strip()
-        t_s = (row.get("t_sample_unix") or "").strip()
-        imb_s = (row.get("imb") or "").strip()
+        sid_s = str(row.get("sample_id") or "").strip()
+        t_s = str(row.get("t_sample_unix") or "").strip()
+        imb_s = str(row.get("imb") or "").strip()
         if not (sid_s and t_s and imb_s):
             continue
         try:
@@ -495,7 +481,7 @@ def load_recent_signals_with_dynamic_weights(
             series = venue_data.get(v) or []
             pairs = [(ti, imb, dm) for ti, imb, dm in series if window_start <= ti <= t and dm is not None]
             venue_data_at_t[v] = pairs
-        weights_map = compute_dynamic_weights(
+        weights_map = v3_compute_dynamic_weights(
             venue_data_at_t,
             window_sec=dw_window_sec,
             k=dw_k,
@@ -503,62 +489,13 @@ def load_recent_signals_with_dynamic_weights(
             use_spearman=dw_use_spearman,
             base_weights=base_weights,
         )
-        score_t = compute_weighted_score_at_t(imbs, weights_map)
+        score_t = v3_compute_weighted_score_at_t(imbs, weights_map)
         if abs(score_t) >= float(min_abs_score):
             out_signals.append((t, score_t))
     return sorted(out_signals, key=lambda x: x[0])
 
 
-def compute_raw_score_at_time(
-    rows: list[dict[str, str]],
-    as_of_ts: float,
-    venues: list[str],
-    weights: list[float],
-    *,
-    time_window_sec: float = 30.0,
-    min_abs_score: float = 0.1,
-    decay_rate: float = 0.15,
-    ewma_alpha: float = 0.2,
-    ewma_state: Optional[float] = None,
-) -> tuple[float, Optional[float]]:
-    """
-    回测用：在截至 as_of_ts 的数据上，用与 score_cex 相同的滚动窗口 + 时间衰减 + EWMA 逻辑计算 raw_score。
-    调用方需保证 rows 仅包含 t_sample_unix <= as_of_ts 的 row，并按时间顺序依次调用并传入上一时刻的 ewma_state。
-
-    Returns:
-        (raw_score, next_ewma_state)
-    """
-    all_signals = _iter_complete_signals_from_rows(
-        rows, venues=venues, weights=weights, min_abs_score=min_abs_score
-    )
-    cutoff_ts = as_of_ts - float(time_window_sec)
-    recent = [
-        (t, s)
-        for t, s in all_signals
-        if _normalize_ts(float(t)) >= cutoff_ts and abs(float(s)) >= float(min_abs_score)
-    ]
-    recent = sorted(recent, key=lambda x: x[0])
-    if not recent:
-        next_state = ewma_state if ewma_state is not None else 0.0
-        return (float(next_state), next_state)
-    weighted_sum = 0.0
-    total_weight = 0.0
-    decay_rate_val = float(decay_rate)
-    for t, s in recent:
-        t_norm = _normalize_ts(float(t))
-        age_sec = as_of_ts - t_norm
-        w = math.exp(-decay_rate_val * age_sec)
-        weighted_sum += w * float(s)
-        total_weight += w
-    current_raw = weighted_sum / total_weight if total_weight > 0 else 0.0
-    if ewma_state is None:
-        raw_score = current_raw
-    else:
-        raw_score = float(ewma_alpha) * current_raw + (1.0 - float(ewma_alpha)) * ewma_state
-    return (float(raw_score), float(raw_score))
-
-
-def compute_raw_score_from_signals(
+def v3_compute_raw_score_from_signals(
     signals: list[tuple[float, float]],
     as_of_ts: float,
     *,
@@ -567,14 +504,8 @@ def compute_raw_score_from_signals(
     decay_rate: float = 0.15,
     ewma_alpha: float = 0.2,
     ewma_state: Optional[float] = None,
-) -> tuple[float, Optional[float]]:
-    """
-    回测用（高性能）：对已计算好的 (t, score) 信号列表做时间窗口过滤 + 时间衰减 + EWMA。
-    调用方需保证 signals 中 t <= as_of_ts，且按时间顺序依次调用并传入上一时刻的 ewma_state。
-
-    Returns:
-        (raw_score, next_ewma_state)
-    """
+) -> tuple[float, float]:
+    """对已计算好的 (t, score) 信号列表做时间窗口过滤 + 时间衰减 + EWMA。Returns (raw_score, next_ewma_state)。"""
     cutoff_ts = as_of_ts - float(time_window_sec)
     recent = [
         (t, s)
@@ -602,9 +533,6 @@ def compute_raw_score_from_signals(
     return (float(raw_score), float(raw_score))
 
 
-_TS_WARNED: set[float] = set()  # 异常时间戳只告警一次
-
-
 def _normalize_ts(ts: float) -> float:
     """将时间戳统一规范为秒：微秒(>1e15)、毫秒(>1e12) 一次转换；异常范围打一次告警。Unix 秒约 1e9。"""
     t = float(ts)
@@ -617,7 +545,7 @@ def _normalize_ts(ts: float) -> float:
         key = round(t, 6)
         if key not in _TS_WARNED:
             _TS_WARNED.add(key)
-            print(f"[cex] _normalize_ts: 异常时间戳范围 ts={ts} -> {t}s (可能数据源错误)", flush=True)
+            logger.warning("[cex] _normalize_ts: 异常时间戳范围 ts=%s -> %ss (可能数据源错误)", ts, t)
     return float(t)
 
 
@@ -706,7 +634,7 @@ def _warmup_normalizer_from_csv(
     earliest = min((_normalize_ts(t) for t, _ in signals), default=float("inf"))
     use_full_scan = earliest > cutoff
     if use_full_scan:
-        print("[cex] warmup: tail 不够覆盖 2h，改用全量扫描", flush=True)
+        logger.info("[cex] warmup: tail 不够覆盖 2h，改用全量扫描")
         import csv
 
         header = _read_csv_header(csv_path)
@@ -742,7 +670,10 @@ def _warmup_normalizer_from_csv(
         newest_ts = t_s if newest_ts is None else max(newest_ts, t_s)
     normalizer._cleanup(float(now_s))
     last_ts_str = f"{last_ts:.0f}" if last_ts is not None else "None"
-    print(f"[cex] warmup: 已补齐样本 {used} 条 (lookback_s={int(lookback_seconds)}, cutoff={cutoff:.0f}, warmup_end={warmup_end:.0f}, last_ts={last_ts_str})", flush=True)
+    logger.info(
+        "[cex] warmup: 已补齐样本 %d 条 (lookback_s=%d, cutoff=%.0f, warmup_end=%.0f, last_ts=%s)",
+        used, int(lookback_seconds), cutoff, warmup_end, last_ts_str,
+    )
 
 
 def _warmup_normalizer_recursive(
@@ -781,7 +712,7 @@ def _warmup_normalizer_recursive(
             warmup_end_ts=warmup_end_ts,  # 当前文件使用 warmup_end_ts
         )
     except Exception as e:
-        print(f"[cex] warmup: 当前文件失败 {type(e).__name__}: {e}", flush=True)
+        logger.warning("[cex] warmup: 当前文件失败 %s: %s", type(e).__name__, e)
     
     # 检查是否还需要更多数据
     files_checked = 1
@@ -790,7 +721,7 @@ def _warmup_normalizer_recursive(
         if prev_csv is None or not prev_csv.exists():
             break
         try:
-            print(f"[cex] warmup: 数据仍不足，继续从上一个文件加载: {prev_csv.name}", flush=True)
+            logger.info("[cex] warmup: 数据仍不足，继续从上一个文件加载: %s", prev_csv.name)
             # 对于之前的文件，不使用 warmup_end_ts（使用 None，即 now_ts）
             _warmup_normalizer_from_csv(
                 csv_path=prev_csv,
@@ -804,13 +735,13 @@ def _warmup_normalizer_recursive(
             files_checked += 1
             prev_csv = _prev_cex_slice_path(prev_csv)
         except Exception as e:
-            print(f"[cex] warmup: 上一个文件失败 {type(e).__name__}: {e}", flush=True)
+            logger.warning("[cex] warmup: 上一个文件失败 %s: %s", type(e).__name__, e)
             break
     
     if _needs_warmup(normalizer, now_ts=now_ts):
-        print(f"[cex] warmup: 警告：已检查 {files_checked} 个文件，normalizer history仍不足，z_eff 可能为0直到样本补齐", flush=True)
+        logger.warning("[cex] warmup: 警告：已检查 %d 个文件，normalizer history仍不足，z_eff 可能为0直到样本补齐", files_checked)
     else:
-        print(f"[cex] warmup: 完成，已从 {files_checked} 个文件加载数据", flush=True)
+        logger.info("[cex] warmup: 完成，已从 %d 个文件加载数据", files_checked)
 
 
 @dataclass(frozen=True)
@@ -826,11 +757,8 @@ class CexScoreResult:
 class AdaptiveScoreNormalizer:
     """
     基于历史分布的 Z-score 标准化器（trimmed mean + MAD + 可选波动率归一化 + soft clip）。
-
     动态维护过去 N 秒的 score 历史，用截尾均值和 MAD 计算稳健 Z-score，
     可选按相对波动率缩放，并用 tanh 做软截断。
-    假设每 symbol 单线程调用（同一 cache_key 串行）。
-
     Args:
         lookback_seconds: 回溯窗口（秒），默认 7200（2 小时）
         min_samples: 最小样本数，低于此值返回原始 score，默认 50
@@ -838,8 +766,6 @@ class AdaptiveScoreNormalizer:
         use_vol_norm: 是否按相对波动率归一化
         vol_window_sec: 波动率历史窗口（秒）
         clip_limit: soft clip 上下限（tanh 饱和）
-
-    注意：内部使用 deque，非线程安全；假设每 symbol 单线程调用，多线程时需在调用方加锁。
     """
 
     def __init__(
@@ -857,8 +783,8 @@ class AdaptiveScoreNormalizer:
         self.use_vol_norm = bool(use_vol_norm)
         self.vol_window_sec = float(vol_window_sec)
         self.clip_limit = float(clip_limit)
-        self.history: deque[tuple[float, float]] = deque()  # (ts, raw_score)
-        self.vol_history: deque[tuple[float, float]] = deque()  # (ts, mid_price) for vol
+        self.history: deque[tuple[float, float]] = deque()
+        self.vol_history: deque[tuple[float, float]] = deque()
 
     def update(
         self,
@@ -884,12 +810,7 @@ class AdaptiveScoreNormalizer:
                 self.vol_history.popleft()
 
     def normalize(self, score: float, timestamp: Optional[float] = None) -> tuple[float, dict[str, Any]]:
-        """
-        标准化 score 为 Z-score（trimmed mean + MAD；可选相对波动率缩放；soft clip）。
-
-        Returns:
-            (z_score, stats_dict)，含 mean, mad/scale, n_samples, is_normalized, vol_factor 等。
-        """
+        """标准化 score 为 Z-score（trimmed mean + MAD；可选相对波动率缩放；soft clip）。"""
         ts = _normalize_ts(float(timestamp) if timestamp is not None else time.time())
         self._cleanup(ts)
 
@@ -906,20 +827,18 @@ class AdaptiveScoreNormalizer:
             }
 
         scores = [s for _, s in self.history]
-        # Trimmed mean（截尾均值，两端各去掉 winsorize_prop）
         if _trim_mean is not None and 0 < self.winsorize_prop < 0.5:
             mean = float(_trim_mean(scores, self.winsorize_prop))
         else:
             mean = sum(scores) / len(scores)
         deviations = [abs(s - mean) for s in scores]
-        mad = statistics.median(deviations) * 1.4826  # robust scale (MAD -> approx std)
+        mad = statistics.median(deviations) * 1.4826
 
         if mad < 1e-9:
             z_score = 0.0
         else:
             z_score = (float(score) - mean) / mad
 
-        # 相对波动率归一化：stdev(mids)/median(mids)，尺度无关；mids 异常时 fallback 到 vol_factor=1.0
         vol_factor = 1.0
         vol_fallback = False
         if self.use_vol_norm and len(self.vol_history) >= 2:
@@ -934,9 +853,8 @@ class AdaptiveScoreNormalizer:
             z_score /= max(vol_factor, 1e-6)
             if vol_fallback and id(self) not in _LOGGED_VOL_FALLBACK:
                 _LOGGED_VOL_FALLBACK.add(id(self))
-                print("[cex] normalizer vol_norm: mids 无波动或 med≈0，使用 vol_factor=1.0", flush=True)
+                logger.warning("[cex] normalizer vol_norm: mids 无波动或 med≈0，使用 vol_factor=1.0")
 
-        # Soft clip（tanh 平滑饱和）
         z_score = math.tanh(z_score / self.clip_limit) * self.clip_limit
 
         return float(z_score), {
@@ -964,7 +882,7 @@ class AdaptiveScoreNormalizer:
             "vol_history": list(self.vol_history),
             "saved_at": time.time(),
         }
-        with open(path, "wb") as f:
+        with path.open("wb") as f:
             pickle.dump(state, f)
 
     @classmethod
@@ -973,7 +891,7 @@ class AdaptiveScoreNormalizer:
         if not path.exists():
             return None
         try:
-            with open(path, "rb") as f:
+            with path.open("rb") as f:
                 state = pickle.load(f)
             s = state
             normalizer = cls(
@@ -1002,7 +920,7 @@ class AdaptiveScoreNormalizer:
             normalizer._cleanup(_normalize_ts(time.time()))
             return normalizer
         except Exception as e:
-            print(f"[cex] normalizer load_state 失败: {e!r}", flush=True)
+            logger.warning("normalizer load_state 失败: %s", e)
             return None
 
 
@@ -1119,17 +1037,197 @@ def _recent_chainlink_offsets(nodes: list[dict[str, Any]], *, n_windows: int) ->
     return offsets[-int(n_windows) :]
 
 
+def _fetch_binance_ohlcv(
+    *,
+    symbol: str = "BTC/USDT",
+    timeframe: str = "1h",
+    since_ms: Optional[int] = None,
+    limit: int = 24,
+    n_hours: Optional[int] = None,
+    cache_dir: Optional[Path] = None,
+    max_age_s: float = 3600.0,
+) -> list[list]:
+    """Fetch OHLCV from Binance via ccxt. since_ms must be milliseconds. On first failure wait 5s and retry once."""
+    try:
+        import ccxt
+    except ImportError:
+        logger.warning("ccxt missing, fallback to Chainlink")
+        return []
+    limit = max(24, n_hours or limit)
+    try:
+        exchange = ccxt.binance({"enableRateLimit": True})
+        rate_limit_ms = getattr(exchange, "rateLimit", 1000)
+        time.sleep(rate_limit_ms / 1000.0)
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
+        if not ohlcv:
+            time.sleep(5.0)
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
+        return ohlcv if isinstance(ohlcv, list) else []
+    except Exception as e:
+        logger.warning("Binance fetch failed: %s", e)
+        time.sleep(5.0)
+        try:
+            exchange = ccxt.binance({"enableRateLimit": True})
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=limit)
+            return ohlcv if isinstance(ohlcv, list) else []
+        except Exception as e2:
+            logger.warning("Binance retry failed: %s", e2)
+            return []
+
+
+def _ohlcv_to_offsets(
+    candles: list[list],
+    n_windows: int,
+    *,
+    now_ts: Optional[float] = None,
+) -> tuple[list[float], bool]:
+    """
+    Convert OHLCV to offsets. Filter only future bars (timestamp >= now).
+    Allow ongoing bar [now-3600, now]; set includes_ongoing_bar=True if used.
+    Returns (offsets, includes_ongoing_bar).
+    """
+    if len(candles) < 2:
+        return [], False
+    now = (now_ts or time.time()) * 1000.0
+    closes: list[tuple[float, float]] = []
+    for c in candles:
+        if len(c) < 6:
+            continue
+        ts_ms = float(c[0])
+        close = float(c[4])
+        if ts_ms >= now:
+            continue
+        closes.append((ts_ms, close))
+    closes.sort(key=lambda x: x[0])
+    offsets: list[float] = []
+    includes_ongoing = False
+    for i in range(len(closes) - 1):
+        t0, p0 = closes[i]
+        t1, p1 = closes[i + 1]
+        if t1 >= now:
+            includes_ongoing = True
+        offsets.append(abs(p1 - p0))
+    if n_windows > 0 and offsets:
+        offsets = offsets[-int(n_windows) :]
+    return offsets, includes_ongoing
+
+
+def _get_binance_offsets(
+    *,
+    symbol: str = "BTC/USDT",
+    timeframe: str = "1h",
+    n_windows: int = 20,
+    n_hours: Optional[int] = 48,
+    cache_dir: Optional[Path] = None,
+    max_age_s: float = 300.0,
+) -> tuple[list[float], dict[str, Any]]:
+    """Get offsets from Binance OHLCV with rolling deque and disk cache. Returns (offsets, meta)."""
+    global _BINANCE_OHLCV_DEQUE, _BINANCE_DEQUE_MAXLEN
+    meta: dict[str, Any] = {}
+    maxlen = max(n_windows * 2, 48)
+    _BINANCE_DEQUE_MAXLEN = maxlen
+    limit = max(24, n_hours or 48)
+    cache_path = Path(cache_dir) if cache_dir else Path(".cache")
+    cache_file = cache_path / "binance_ohlcv_cache.pkl"
+    now_ms = int(time.time() * 1000)
+    if _BINANCE_OHLCV_DEQUE is None or len(_BINANCE_OHLCV_DEQUE) == 0:
+        if cache_file.exists():
+            try:
+                with cache_file.open("rb") as f:
+                    data = pickle.load(f)
+                fetched_at = data.get("fetched_at", 0.0)
+                if (time.time() - fetched_at) <= max_age_s:
+                    rows = data.get("rows") or []
+                    _BINANCE_OHLCV_DEQUE = deque(rows, maxlen=maxlen)
+                    offsets, inc = _ohlcv_to_offsets(list(_BINANCE_OHLCV_DEQUE), n_windows, now_ts=time.time())
+                    if inc:
+                        meta["includes_ongoing_bar"] = True
+                    return offsets, meta
+            except Exception as e:
+                logger.warning("Cache load failed: %s", e)
+        ohlcv = _fetch_binance_ohlcv(
+            symbol=symbol,
+            timeframe=timeframe,
+            since_ms=None,
+            limit=limit,
+            n_hours=n_hours,
+            cache_dir=cache_path,
+            max_age_s=max_age_s,
+        )
+        if not ohlcv:
+            return [], meta
+        _BINANCE_OHLCV_DEQUE = deque(ohlcv, maxlen=maxlen)
+        try:
+            cache_path.mkdir(parents=True, exist_ok=True)
+            with cache_file.open("wb") as f:
+                pickle.dump({"fetched_at": time.time(), "rows": list(_BINANCE_OHLCV_DEQUE)}, f)
+        except Exception as e:
+            logger.warning("Cache save failed: %s", e)
+    else:
+        last_ts_ms = int(_BINANCE_OHLCV_DEQUE[-1][0]) if _BINANCE_OHLCV_DEQUE else 0
+        since_ms = last_ts_ms + 3600000 - 300000
+        ohlcv = _fetch_binance_ohlcv(
+            symbol=symbol,
+            timeframe=timeframe,
+            since_ms=since_ms,
+            limit=2,
+            n_hours=n_hours,
+            cache_dir=cache_path,
+            max_age_s=max_age_s,
+        )
+        for row in ohlcv or []:
+            if len(row) >= 6 and (not _BINANCE_OHLCV_DEQUE or row[0] != _BINANCE_OHLCV_DEQUE[-1][0]):
+                _BINANCE_OHLCV_DEQUE.append(row)
+    offsets, includes_ongoing = _ohlcv_to_offsets(
+        list(_BINANCE_OHLCV_DEQUE), n_windows, now_ts=time.time()
+    )
+    if includes_ongoing:
+        meta["includes_ongoing_bar"] = True
+    return offsets, meta
+
+
+def _trimmed_mean_fallback(values: list[float], proportiontocut: float = 0.1) -> float:
+    """Trimmed mean using scipy if available, else median."""
+    if _trim_mean is not None and len(values) >= 3:
+        try:
+            return float(_trim_mean(values, proportiontocut))
+        except Exception:
+            pass
+    logger.debug("SciPy unavailable, using median fallback")
+    return float(statistics.median(values))
+
+
 class SignalOptimizer:
+    """
+    Signal decay optimizer with EMA-adaptive mu and volatility.
+
+    Fallback & Degradation Paths:
+    - no scipy: use statistics.median for base_mu, no bootstrap CI
+    - small batch (<3): skip all EMA update
+    - small batch (<5): skip std update, still update ema_mu
+    - std_batch > 3*ema_std: skip update (anomaly)
+    - load_state version mismatch: partial recovery, clear historical_offsets
+    - historical_offsets empty after load: restore from fallback_offsets if provided
+    """
+
     def __init__(
         self,
         *,
         T: float = 15.0,
-        lambda_base: float = 0.2,
+        lambda_base: float = 0.01,
         sigma: float = 5.0,
         multiplier: float = 1.0,
         min_mu: float = 8.0,
         max_mu: float = 60.0,
         N_windows: int = 20,
+        ema_alpha_mu: float = 0.1,
+        ema_alpha_lambda: float = 0.05,
+        max_factor: float = 2.0,
+        min_offsets: int = 5,
+        default_mu: float = 20.0,
+        threshold: float = 0.2,
+        conservative_scaling_enabled: bool = True,
+        fallback_offsets: Optional[list[float]] = None,
     ) -> None:
         self.T = float(T)
         self.lambda_base = float(lambda_base)
@@ -1138,253 +1236,244 @@ class SignalOptimizer:
         self.min_mu = float(min_mu)
         self.max_mu = float(max_mu)
         self.N_windows = int(N_windows)
+        self.ema_alpha_mu = float(ema_alpha_mu)
+        self.ema_alpha_lambda = float(ema_alpha_lambda)
+        self.max_factor = float(max_factor)
+        self.min_offsets = int(min_offsets)
+        self.default_mu = float(default_mu)
+        self.threshold = float(threshold)
+        self.conservative_scaling_enabled = bool(conservative_scaling_enabled)
+        self.fallback_offsets = list(fallback_offsets) if fallback_offsets else None
+        self.ema_mu: Optional[float] = None
+        self.ema_std: Optional[float] = None
         self.historical_offsets: list[float] = []
+
+    @classmethod
+    def load_params_from_file(cls, path: Path) -> dict[str, Any]:
+        """Load params from JSON or YAML for use as SignalOptimizer(**kwargs)."""
+        path = Path(path)
+        if not path.exists():
+            return {}
+        suf = path.suffix.lower()
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                raw = f.read()
+            if suf in (".json",):
+                return dict(json.loads(raw))
+            if suf in (".yaml", ".yml"):
+                try:
+                    import yaml
+                    return dict(yaml.safe_load(raw) or {})
+                except ImportError:
+                    logger.warning("PyYAML not installed, cannot load %s", path)
+                    return {}
+        except Exception as e:
+            logger.warning("load_params_from_file failed: %s", e)
+        return {}
 
     def set_historical_offsets(self, offsets: list[float]) -> None:
         trimmed = [abs(float(x)) for x in offsets]
         if self.N_windows > 0:
             trimmed = trimmed[-int(self.N_windows) :]
         self.historical_offsets = trimmed
+        if len(trimmed) < self.min_offsets:
+            logger.warning(
+                "Offsets empty or too few (n=%d, min=%d), keeping last ema_mu=%s",
+                len(trimmed),
+                self.min_offsets,
+                self.ema_mu,
+            )
+            return
+        try:
+            if len(trimmed) < 3:
+                logger.warning("Batch critically small (<3), skipping EMA update entirely")
+                return
+            base_mu = _trimmed_mean_fallback(trimmed, 0.1)
+            if _trim_mean is None:
+                logger.info("SciPy unavailable, using median fallback")
+            if self.ema_mu is None:
+                self.ema_mu = base_mu
+                self.ema_std = statistics.stdev(trimmed) if len(trimmed) >= 2 else (base_mu * 0.1)
+                return
+            if len(trimmed) < 5:
+                self.ema_mu = self.ema_alpha_mu * base_mu + (1.0 - self.ema_alpha_mu) * self.ema_mu
+                logger.info(
+                    "Batch too small (<5), skipping std update, keeping ema_std=%.4f",
+                    self.ema_std or 0.0,
+                )
+                return
+            std_batch = statistics.stdev(trimmed)
+            if self.ema_std is not None and std_batch > 3.0 * self.ema_std:
+                logger.warning("Batch std > 3*ema_std, skipping update (anomaly)")
+                return
+            self.ema_mu = self.ema_alpha_mu * base_mu + (1.0 - self.ema_alpha_mu) * self.ema_mu
+            self.ema_std = self.ema_alpha_lambda * std_batch + (1.0 - self.ema_alpha_lambda) * (self.ema_std or std_batch)
+        except (ValueError, OverflowError) as e:
+            logger.warning("set_historical_offsets error: %s", e)
 
     def compute_dynamic_mu(self) -> float:
-        if not self.historical_offsets:
-            return 20.0
-        base_mu = float(statistics.median(self.historical_offsets))
-        final_mu = max(self.min_mu, min(self.max_mu, self.multiplier * base_mu))
-        return float(final_mu)
+        mu = self.ema_mu if self.ema_mu is not None else self.default_mu
+        return max(self.min_mu, min(self.max_mu, self.multiplier * mu))
 
-    def dynamic_decay(self, elapsed_time: float, cum_change: float) -> float:
+    def compute_mu_ci(
+        self,
+        offsets: Optional[list[float]] = None,
+        n_resamples: int = 1000,
+        confidence: float = 0.95,
+    ) -> tuple[float, float]:
+        """Bootstrap CI for mu. Uses winsorized offsets if len>=10; else wide CI."""
+        use = offsets if offsets is not None else self.historical_offsets
+        ema_mu = self.ema_mu if self.ema_mu is not None else self.default_mu
+        if len(use) < 3:
+            return (ema_mu * 0.9, ema_mu * 1.1)
+        if len(use) < 10:
+            return (ema_mu * 0.9, ema_mu * 1.1)
+        try:
+            import numpy as np
+        except ImportError:
+            return (ema_mu * 0.9, ema_mu * 1.1)
+        arr = np.asarray(use, dtype=float)
+        p1, p99 = np.percentile(arr, [1, 99])
+        clipped = np.clip(arr, p1, p99)
+        low = (1 - confidence) / 2 * 100
+        high = (1 + confidence) / 2 * 100
+        if _scipy_bootstrap is not None:
+            try:
+                r = _scipy_bootstrap(
+                    (clipped,),
+                    np.mean,
+                    n_resamples=n_resamples,
+                    confidence_level=confidence,
+                    method="percentile",
+                )
+                return (float(r.confidence_interval.low), float(r.confidence_interval.high))
+            except Exception:
+                pass
+        resamples = [
+            float(np.mean(np.random.choice(clipped, size=len(clipped), replace=True)))
+            for _ in range(n_resamples)
+        ]
+        ci = np.percentile(resamples, [low, high])
+        return (float(ci[0]), float(ci[1]))
+
+    def dynamic_decay(
+        self,
+        elapsed_time: float,
+        cum_change: float,
+        *,
+        return_meta: bool = False,
+    ) -> float | tuple[float, dict[str, Any]]:
+        """
+        Decay factor with volatility-adaptive lambda.
+        sigma is fixed (not propagated to CI); may be extended later.
+        """
         abs_delta = abs(float(cum_change))
         mu = self.compute_dynamic_mu()
         try:
             g_delta = 1.0 / (1.0 + math.exp(-(abs_delta - mu) / float(self.sigma)))
         except OverflowError:
             g_delta = 1.0 if abs_delta > mu else 0.0
-        effective_lambda = float(self.lambda_base) * float(g_delta)
-        return math.exp(-effective_lambda * float(elapsed_time))
-
-
-def _recent_vol_from_mid_series(
-    mid_series: list[tuple[float, float]],
-    window_sec: float,
-) -> Optional[float]:
-    """从 (t, mid) 序列取最近 window_sec 内的 mid，算 stdev；不足 2 点返回 None。"""
-    if len(mid_series) < 2:
-        return None
-    now_t = mid_series[-1][0]
-    cutoff = now_t - window_sec
-    mids = [m for t, m in mid_series if t >= cutoff]
-    if len(mids) < 2:
-        return None
-    return float(statistics.stdev(mids))
-
-
-def _vol_mean_from_mid_series(
-    mid_series: list[tuple[float, float]],
-    window_sec: float,
-    hist_window_sec: float,
-) -> Optional[float]:
-    """在最近 hist_window_sec 内做滚动 window_sec 的 stdev，取中位数作为 vol_mean。"""
-    if len(mid_series) < 2:
-        return None
-    now_t = mid_series[-1][0]
-    cutoff = now_t - hist_window_sec
-    in_range = [(t, m) for t, m in mid_series if t >= cutoff]
-    if len(in_range) < 2:
-        return None
-    mids = [m for _, m in in_range]
-    w = max(2, int(window_sec / 2))
-    if len(mids) < w:
-        return None
-    vol_list = []
-    for i in range(len(mids) - w + 1):
-        slice_m = mids[i : i + w]
-        if len(slice_m) >= 2:
-            vol_list.append(statistics.stdev(slice_m))
-    if not vol_list:
-        return None
-    return float(statistics.median(vol_list))
-
-
-def _vol_mean_from_vol_history(
-    vol_history: "deque[tuple[float, float]]",
-    window_size: int = 30,
-) -> Optional[float]:
-    """从 normalizer.vol_history 的 (t, mid) 做滚动窗口 stdev，取中位数。"""
-    vh = list(vol_history)
-    if len(vh) < window_size:
-        return None
-    mids = [m for _, m in vh]
-    vol_list = []
-    for i in range(len(mids) - window_size + 1):
-        slice_m = mids[i : i + window_size]
-        if len(slice_m) >= 2:
-            vol_list.append(statistics.stdev(slice_m))
-    if not vol_list:
-        return None
-    return float(statistics.median(vol_list))
-
-
-def _compute_delta_pct_live(
-    mid_series: list[tuple[float, float]],
-    window_sec: float = 15.0,
-) -> float:
-    """
-    Live 用「过去」window_sec 的 mid 变化率作为 delta_*_pct。
-    注意：训练时 delta_15s_pct 是未来收益，live 用过去 15s 作为代理，可能有分布偏移。
-    时间容忍：找最近满足 t <= current_t - window_sec 的点；若无则用最近点或 current_mid 作 fallback。
-    """
-    if not mid_series or len(mid_series) < 2:
-        return 0.0
-    current_t = mid_series[-1][0]
-    current_mid = mid_series[-1][1]
-    past_mid: Optional[float] = None
-    for t, mid in reversed(mid_series[:-1]):
-        if t <= current_t - window_sec:
-            past_mid = mid
-            break
-    if past_mid is None:
-        past_mid = mid_series[-2][1] if len(mid_series) > 1 else current_mid
-    if past_mid is None or abs(past_mid) < 1e-12:
-        return 0.0
-    return float((current_mid - past_mid) / past_mid * 100.0)
-
-
-# 与 training/zeff_ai_system.py 对齐的 6 维特征顺序
-_ZEFF_MLP_FEATURES = ["zscore", "raw_score", "btc_vol_60s", "raw_score_ema", "elapsed_seconds_in_window", "cum_change_abs"]
-
-
-def _build_zeff_features(
-    cache_key: str,
-    mid_series: list[tuple[float, float]],
-    normalized_score: float,
-    raw_score: float,
-    timestamp: float,
-    raw_score_ema: float,
-    vol_60s: Optional[float] = None,
-    elapsed_seconds: Optional[float] = None,
-    cum_change_abs: Optional[float] = None,
-) -> dict[str, float]:
-    """
-    构建 MLP zeff 的 6 维特征（新方案）；live 容错：特征缺失填 0。
-    新增：elapsed_seconds_in_window（窗口内位置），cum_change_abs（窗口内BTC价格变化，美元）。
-    """
-    # 特征缺失时用 0 补全
-    if vol_60s is None:
-        vol_60s = 0.0
-    if elapsed_seconds is None:
-        elapsed_seconds = 0.0
-    if cum_change_abs is None:
-        cum_change_abs = 0.0
-
-    return {
-        "zscore": float(normalized_score),
-        "raw_score": float(raw_score),
-        "btc_vol_60s": float(vol_60s),
-        "raw_score_ema": float(raw_score_ema),
-        "elapsed_seconds_in_window": float(elapsed_seconds),
-        "cum_change_abs": float(cum_change_abs),
-    }
-
-
-class ZeffCalculator:
-    """
-    factor = base_decay * vol_adjust * noise_factor * rl_adjust；
-    zeff = clip(zscore * factor, ±zeff_clip)。
-    高 vol 加速衰减、低 vol 减慢衰减；noise 抑制；历史 acc 反馈。
-    """
-
-    def __init__(
-        self,
-        *,
-        lambda_base: float = 0.18,
-        sigma: float = 12.0,
-        vol_decay_mult: float = 1.2,
-        noise_ema_alpha: float = 0.15,
-        rl_acc_window: int = 100,
-        rl_adjust_range: tuple[float, float] = (0.85, 1.15),
-        rl_low_thresh: float = 0.65,
-        rl_high_thresh: float = 0.75,
-        zeff_clip: float = 4.0,
-        sigma_noise: float = 0.3,
-        rl_linear: bool = False,
-    ) -> None:
-        self.lambda_base = float(lambda_base)
-        self.sigma = float(sigma)
-        self.vol_decay_mult = float(vol_decay_mult)
-        self.noise_ema_alpha = float(noise_ema_alpha)
-        self.rl_acc_window = int(rl_acc_window)
-        self.rl_adjust_range = (float(rl_adjust_range[0]), float(rl_adjust_range[1]))
-        self.rl_low_thresh = float(rl_low_thresh)
-        self.rl_high_thresh = float(rl_high_thresh)
-        self.zeff_clip = float(zeff_clip)
-        self.sigma_noise = float(sigma_noise)
-        self.rl_linear = bool(rl_linear)
-        self.noise_ema: float = 0.0
-        self.rl_acc_history: deque[float] = deque(maxlen=self.rl_acc_window)
-
-    def compute_zeff(
-        self,
-        zscore: float,
-        elapsed_time_min: float,
-        cum_change: float,
-        recent_vol: Optional[float],
-        vol_mean: Optional[float],
-        raw_score: float,
-        mu: float,
-        mad: Optional[float] = None,
-    ) -> float:
-        # base_decay
-        abs_delta = abs(float(cum_change))
+        ema_mu = self.ema_mu if self.ema_mu is not None else self.default_mu
+        ema_std = self.ema_std if self.ema_std is not None else (ema_mu * 0.1)
+        vol_ratio = min(ema_std / max(ema_mu, 1e-9), self.max_factor)
+        effective_lambda = float(self.lambda_base) * float(g_delta) * (1.0 + vol_ratio)
+        decay = math.exp(-effective_lambda * float(elapsed_time))
+        if not return_meta:
+            return decay
+        mu_ci = self.compute_mu_ci()
+        sigma_fixed = self.sigma
         try:
-            g_delta = 1.0 / (1.0 + math.exp(-(abs_delta - mu) / float(self.sigma)))
+            g_lo = 1.0 / (1.0 + math.exp(-(abs_delta - mu_ci[0]) / sigma_fixed))
+            g_hi = 1.0 / (1.0 + math.exp(-(abs_delta - mu_ci[1]) / sigma_fixed))
         except OverflowError:
-            g_delta = 1.0 if abs_delta > mu else 0.0
-        lambda_eff = self.lambda_base * g_delta
-        base_decay = math.exp(-lambda_eff * float(elapsed_time_min))
+            g_lo = 1.0 if abs_delta > mu_ci[0] else 0.0
+            g_hi = 1.0 if abs_delta > mu_ci[1] else 0.0
+        lam_hi = self.lambda_base * g_lo * (1.0 + vol_ratio)
+        lam_lo = self.lambda_base * g_hi * (1.0 + vol_ratio)
+        decay_low = math.exp(-lam_hi * float(elapsed_time))
+        decay_high = math.exp(-lam_lo * float(elapsed_time))
+        meta = {
+            "mu_ci": mu_ci,
+            "decay_low": decay_low,
+            "decay_high": decay_high,
+        }
+        return (decay, meta)
 
-        # 高 vol 时加速衰减（vol_adjust <1），低 vol 时减慢衰减（vol_adjust >1）
-        vol_adjust = 1.0
-        if recent_vol is not None and vol_mean is not None and vol_mean > 1e-9:
-            vol_adjust = 1.0 / (
-                1.0 + max(0.0, (recent_vol - vol_mean) * self.vol_decay_mult)
-            )
+    def save_state(self, path: Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = {
+            "version": 1,
+            "T": self.T,
+            "lambda_base": self.lambda_base,
+            "sigma": self.sigma,
+            "multiplier": self.multiplier,
+            "min_mu": self.min_mu,
+            "max_mu": self.max_mu,
+            "N_windows": self.N_windows,
+            "ema_alpha_mu": self.ema_alpha_mu,
+            "ema_alpha_lambda": self.ema_alpha_lambda,
+            "max_factor": self.max_factor,
+            "min_offsets": self.min_offsets,
+            "default_mu": self.default_mu,
+            "ema_mu": self.ema_mu,
+            "ema_std": self.ema_std,
+            "historical_offsets": list(self.historical_offsets),
+            "saved_at": time.time(),
+        }
+        with path.open("wb") as f:
+            pickle.dump(state, f)
 
-        # noise_factor
-        recurring = self.noise_ema_alpha * float(raw_score) + (
-            1.0 - self.noise_ema_alpha
-        ) * self.noise_ema
-        self.noise_ema = recurring
-        noise = abs(float(raw_score) - recurring)
-        # sigma_noise: 传入 mad 且 >1e-9 时用 mad，否则用 self.sigma_noise（默认 0.3）
-        sigma_n = float(mad) if mad is not None and mad > 1e-9 else self.sigma_noise
-        noise_factor = math.exp(-noise / sigma_n)
-
-        # rl_adjust：线性插值或阈值（0.65/0.75 → 0.85/1.15）
-        avg_acc = (
-            statistics.mean(self.rl_acc_history)
-            if self.rl_acc_history
-            else 0.5
-        )
-        if self.rl_linear:
-            rl_adjust = 0.8 + (avg_acc - 0.5) * 0.8
-            rl_adjust = max(self.rl_adjust_range[0], min(rl_adjust, self.rl_adjust_range[1]))
-        else:
-            if avg_acc < self.rl_low_thresh:
-                rl_adjust = self.rl_adjust_range[0]
-            elif avg_acc > self.rl_high_thresh:
-                rl_adjust = self.rl_adjust_range[1]
+    @classmethod
+    def load_state(
+        cls,
+        path: Path,
+        *,
+        fallback_offsets: Optional[list[float]] = None,
+    ) -> Optional["SignalOptimizer"]:
+        path = Path(path)
+        if not path.exists():
+            return None
+        try:
+            with path.open("rb") as f:
+                state = pickle.load(f)
+            loaded_version = state.get("version", 0)
+            if loaded_version != 1:
+                logger.warning(
+                    "Version mismatch (loaded %d, expected 1), partial recovery or reset",
+                    loaded_version,
+                )
+            kwargs = {
+                "T": state.get("T", 15.0),
+                "lambda_base": state.get("lambda_base", 0.01),
+                "sigma": state.get("sigma", 5.0),
+                "multiplier": state.get("multiplier", 1.0),
+                "min_mu": state.get("min_mu", 8.0),
+                "max_mu": state.get("max_mu", 60.0),
+                "N_windows": state.get("N_windows", 20),
+                "ema_alpha_mu": state.get("ema_alpha_mu", 0.1),
+                "ema_alpha_lambda": state.get("ema_alpha_lambda", 0.05),
+                "max_factor": state.get("max_factor", 2.0),
+                "min_offsets": state.get("min_offsets", 5),
+                "default_mu": state.get("default_mu", 20.0),
+                "fallback_offsets": fallback_offsets,
+            }
+            opt = cls(**kwargs)
+            opt.ema_mu = state.get("ema_mu")
+            opt.ema_std = state.get("ema_std")
+            hist = state.get("historical_offsets") or []
+            if loaded_version != 1:
+                opt.historical_offsets = []
             else:
-                rl_adjust = 1.0
-
-        factor = base_decay * vol_adjust * noise_factor * rl_adjust
-        zeff = float(zscore) * factor
-        zeff = max(-self.zeff_clip, min(zeff, self.zeff_clip))
-        return zeff
-
-    def update_rl_acc(self, acc: float) -> None:
-        """外部（daemon/策略）写入历史准确率。"""
-        self.rl_acc_history.append(float(acc))
+                opt.historical_offsets = list(hist)
+            if not opt.historical_offsets and (fallback_offsets or state.get("fallback_offsets")):
+                fo = fallback_offsets or state.get("fallback_offsets") or []
+                opt.historical_offsets = list(fo)
+                logger.info("Restored historical_offsets from fallback")
+            return opt
+        except Exception as e:
+            logger.warning("load_state failed: %s", e)
+            return None
 
 
 def score_cex(
@@ -1412,6 +1501,11 @@ def score_cex(
     decay_min_mu: float = 8.0,
     decay_max_mu: float = 60.0,
     decay_N_windows: int = 20,
+    decay_params_path: Optional[Path] = None,
+    fallback_path: Optional[Path] = None,
+    use_binance_offsets: bool = True,
+    fallback_default_offsets: Optional[list[float]] = None,
+    use_v3_raw_score: bool = True,
     time_window_sec: float = 30.0,
     min_abs_score: float = 0.1,
     decay_rate: float = 0.15,
@@ -1431,44 +1525,30 @@ def score_cex(
     dw_min_samples: int = 10,
     dw_use_spearman: bool = True,
     dw_base_weights: Optional[dict[str, float]] = None,
-    use_zeff_calculator: bool = False,
-    zeff_lambda_base: float = 0.18,
-    zeff_sigma: float = 12.0,
-    zeff_vol_decay_mult: float = 1.2,
-    zeff_noise_ema_alpha: float = 0.15,
-    zeff_rl_acc_window: int = 100,
-    zeff_rl_adjust_range: tuple[float, float] = (0.85, 1.15),
-    zeff_rl_low_thresh: float = 0.65,
-    zeff_rl_high_thresh: float = 0.75,
-    zeff_clip: float = 4.0,
-    zeff_sigma_noise: float = 0.3,
-    zeff_rl_linear: bool = False,
-    feedback_acc: Optional[float] = None,
-    use_zeff_model: bool = False,
-    zeff_model_path: Optional[str] = None,
-    elapsed_seconds: Optional[float] = None,
-    cum_change_abs: Optional[float] = None,
+    use_vol_norm: bool = False,
+    winsorize_prop: float = 0.01,
+    clip_limit: float = 3.0,
+    normalizer_min_samples: Optional[int] = None,
+    min_samples: Optional[int] = None,
 ) -> float | CexScoreResult:
     """
-    CEX 打分器：输入 live CSV + 参数（权重等）→ 输出单一 float score。
+    CEX 打分器壳：输入 live CSV + 参数（权重等）→ 输出单一 float score。
 
     说明：
-    - raw_score 计算采用滚动窗口聚合：从"最新一个 sample"改为"最近时间窗口（15-30秒）内所有完整 sample 的聚合"。
-    - 聚合方式：时间衰减加权平均（强调最新 sample）+ EWMA 平滑（连续调用时进一步平滑）。
-    - 通过 min_abs_score 过滤弱信号，减少噪声。
-    - 最终通过 Z-score 标准化和动态衰减得到 z_eff。
+    - 当前实现为了与旧脚本行为一致，默认复用 `trade/polymarket_live_run_current_window.py` 的尾部扫描逻辑。
+    - 另一个 agent 可以把这里替换为更复杂的预测/聚合模型，但对外仍保持 `float` 输出。
     
     Args:
         csv_path: CEX数据CSV文件路径
         venues: 交易所列表
         weights: 对应的权重列表
         weights_by_venue: venue -> weight的字典（优先级高于venues/weights）
-        tail_bytes: 读取CSV尾部的字节数，默认16384（足够覆盖30-60秒历史）
+        tail_bytes: 读取CSV尾部的字节数
         use_normalization: 是否使用Z-score标准化，默认True（推荐）
         lookback_seconds: 标准化回溯窗口（秒），默认7200（2小时）
         normalizer_cache_dir: cache目录，默认为workspace/.cache
         symbol: 交易品种（用于cache文件命名），默认"btc"
-        return_meta: 返回 CexScoreResult（含 z_eff/extra_factor 及聚合统计）
+        return_meta: 返回 CexScoreResult（含 z_eff/extra_factor）
         elapsed_time_min: 已过时间（分钟），用于动态衰减
         cum_change: 当前累计偏移（美元），用于动态衰减
         chainlink_feed_id: Chainlink feedId（用于历史偏移）
@@ -1482,46 +1562,28 @@ def score_cex(
         decay_min_mu: mu 下限
         decay_max_mu: mu 上限
         decay_N_windows: 历史窗口数量
-        time_window_sec: 滚动窗口秒数，默认30.0（15-30秒适合高频预测）
-        min_abs_score: 弱信号过滤阈值，默认0.1（0.1-0.3减少噪声10-20%）
-        decay_rate: 时间衰减率（每秒），默认0.15（半衰期≈4-5s，可调0.1-0.2）
-        ewma_alpha: EWMA 衰减系数，默认0.2（半衰期≈3-4s，可调0.1-0.3）
-        use_volatility_filter: 是否启用波动率过滤（高波动时衰减/置零 raw_score）
-        vol_window_sec: 波动率滚动窗口（秒）
-        vol_hist_window_sec: 历史波动率窗口（秒）
-        vol_multiplier: 阈值 = 历史波动率中位数 * multiplier
-        vol_decay_factor: 高波动时 raw_score *= decay_factor（若未置零）
-        vol_use_atr: 使用 ATR 而非 std 计算波动率
-        vol_extreme_zero: 高波动时直接置零（否则衰减）
-        mid_venue: 用于波动率的 mid 来源 venue（默认首 venue）
-        use_dynamic_weights: 是否使用动态 venue 权重（基于近期 imb vs delta_mid 置信度）
-        dw_window_sec: 动态权重窗口（秒）
-        dw_horizon_sec: delta_mid 预测 horizon（秒）
-        dw_k: 权重调整敏感度
-        dw_min_samples: 计算 corr 最少样本数
-        dw_use_spearman: 用 Spearman（否则 sign-match）
-        dw_base_weights: 各 venue 基础权重（可选）
-        use_zeff_calculator: 是否使用 ZeffCalculator 计算 z_eff（base_decay * vol_adjust * noise_factor * rl_adjust + clip）
-        feedback_acc: 可选，当前步方向准确率；若提供且 use_zeff_calculator=True 则写入 ZeffCalculator 的 rl_acc_history
-        use_zeff_model: 是否使用 MLP 模型计算 z_eff（v3）；未传路径时使用默认硬编码路径
-        zeff_model_path: MLP 模型 .pth 路径；未传时使用 DEFAULT_ZEFF_MODEL_PATH（collect_data 内硬编码）
     
+    use_v3_raw_score: 是否使用 v3 的 raw_score 聚合逻辑（滚动窗口 + 时间衰减 + EWMA + 波动率过滤 + 动态权重）。默认 True，确保与 v3 测试一致；设为 False 则回退 v4 原单 sample 逻辑（仅用最新完整信号）。
+    time_window_sec, min_abs_score, decay_rate, ewma_alpha: v3 聚合参数。
+    use_volatility_filter, vol_*: 波动率过滤参数。
+    mid_venue: 用于波动率的 venue；默认首 venue。
+    use_dynamic_weights, dw_*: 动态权重参数。
+    use_vol_norm, winsorize_prop, clip_limit: normalizer v3 参数。
+    normalizer_min_samples: 覆盖 v3 默认 50 时打警告。
+    min_samples: 已废弃，请用 normalizer_min_samples；若传入则覆盖 normalizer_min_samples 并打 warning。
+
     Returns:
         标准化后的score（如果use_normalization=True），否则返回原始score。
-        当 return_meta=True 时，返回 CexScoreResult，包含：
-        - z_eff: 最终有效分数
-        - z_score: 标准化后的分数
-        - extra_factor: 动态衰减因子
-        - n_signals: 聚合使用的信号数量
-        - time_window_sec: 时间窗口大小
-        - decay_rate: 时间衰减率
-        - ewma_alpha: EWMA 系数
-        - signal_span_sec: 信号时间跨度
+        当 return_meta=True 时，返回 CexScoreResult，包含 z_eff、raw_*、z_* 等。
     """
+    global _consecutive_failures, _binance_failed_since, _EWMA_STATE
     t0 = time.perf_counter()
     p = Path(csv_path)
-    
-    # 如果指定路径不存在，尝试从real_hot/自动查找当前12小时分片
+    fallback_path = Path(fallback_path) if fallback_path is not None else Path(".cache/historical_btc.csv")
+    if fallback_path and not fallback_path.parent.exists():
+        fallback_path.parent.mkdir(parents=True, exist_ok=True)
+    default_offsets = fallback_default_offsets if fallback_default_offsets is not None else [20.0] * 20
+
     if not p.exists():
         p = _auto_detect_cex_slice(symbol)
         if not p.exists():
@@ -1536,110 +1598,126 @@ def score_cex(
     if len(venues2) != len(weights2):
         return 0.0
 
-    # 提前计算 cache_key 与 ewma 持久化路径（与 normalizer 同目录）
+    logger.info("[cex] v4 with v3 frontend (use_v3_raw_score=%s)", use_v3_raw_score)
+
     cache_dir = Path(normalizer_cache_dir) if normalizer_cache_dir else Path(".cache")
     cache_file = cache_dir / f"cex_normalizer_{symbol}.pkl"
-    ewma_file = cache_dir / f"cex_ewma_{symbol}.pkl"
+    ewma_file = cache_dir / f"cex_normalizer_{symbol}_ewma.pkl"
     cache_key = str(cache_file.resolve())
 
-    # v3 MLP zeff：未传路径时使用默认硬编码路径
-    zeff_model_path = zeff_model_path or DEFAULT_ZEFF_MODEL_PATH
-    if use_zeff_model and not zeff_model_path:
-        print("[cex] use_zeff_model=True but no path, fallback to v2", flush=True)
-        use_zeff_model = False
-
-    # 使用滚动窗口聚合：加载最近时间窗口内的所有完整信号（固定权重或动态权重）
-    t1 = time.perf_counter()
-    if use_dynamic_weights:
-        dw_tail_bytes = max(tail_bytes, 65536)  # 至少 64KB 以覆盖 ~75s
-        recent_signals = load_recent_signals_with_dynamic_weights(
-            p,
-            venues=venues2,
-            time_window_sec=float(time_window_sec),
-            min_abs_score=float(min_abs_score),
-            tail_bytes=int(dw_tail_bytes),
-            dw_window_sec=float(dw_window_sec),
-            dw_horizon_sec=float(dw_horizon_sec),
-            dw_k=float(dw_k),
-            dw_min_samples=int(dw_min_samples),
-            dw_use_spearman=bool(dw_use_spearman),
-            base_weights=dw_base_weights,
-        )
+    if use_v3_raw_score:
+        logger.info("Using v3 raw_score aggregation logic (rolling window + EWMA)")
     else:
-        recent_signals = load_recent_signals(
-            p,
-            venues=venues2,
-            weights=weights2,
+        logger.info("Using v4 legacy single-sample raw_score")
+
+    n_signals = 0
+    signal_span_sec = 0.0
+    mid_venue_val = mid_venue if mid_venue else (venues2[0] if venues2 else None)
+    if mid_venue_val is None and use_vol_norm:
+        logger.warning("No mid_venue available for vol_norm, skipping vol_history update")
+    vol_rows: Optional[list[dict[str, str]]] = None
+    mid_series: Optional[list[tuple[float, float]]] = None
+    now_ts = time.time()
+    timestamp_else = time.time()
+
+    if use_v3_raw_score:
+        t1 = time.perf_counter()
+        if use_dynamic_weights:
+            recent_signals = v3_load_recent_signals_with_dynamic_weights(
+                p,
+                venues=venues2,
+                time_window_sec=float(time_window_sec),
+                min_abs_score=float(min_abs_score),
+                tail_bytes=max(int(tail_bytes), 65536),
+                dw_window_sec=float(dw_window_sec),
+                dw_horizon_sec=float(dw_horizon_sec),
+                dw_k=float(dw_k),
+                dw_min_samples=int(dw_min_samples),
+                dw_use_spearman=bool(dw_use_spearman),
+                base_weights=dw_base_weights,
+            )
+        else:
+            recent_signals = v3_load_recent_signals(
+                p,
+                venues=venues2,
+                weights=weights2,
+                time_window_sec=float(time_window_sec),
+                min_abs_score=float(min_abs_score),
+                tail_bytes=int(tail_bytes),
+            )
+        t2 = time.perf_counter()
+        if not recent_signals:
+            logger.info(
+                "[cex] timing path=%s load_signals_s=%.3f total_s=%.3f n_signals=0",
+                p, t2 - t1, t2 - t0,
+            )
+            return 0.0
+        now_ts = _normalize_ts(recent_signals[-1][0])
+        raw_score, _ = v3_compute_raw_score_from_signals(
+            recent_signals,
+            now_ts,
             time_window_sec=float(time_window_sec),
             min_abs_score=float(min_abs_score),
-            tail_bytes=int(tail_bytes),
+            decay_rate=float(decay_rate),
+            ewma_alpha=float(ewma_alpha),
+            ewma_state=None,
         )
-    t2 = time.perf_counter()
-    
-    n_signals = len(recent_signals)
-    if not recent_signals:
-        print(
-            f"[cex] timing path={p} load_signals_s={t2 - t1:.3f} total_s={t2 - t0:.3f} n_signals=0 time_window_sec={time_window_sec:.1f}",
-            flush=True,
+        lock = _ewma_lock(cache_key)
+        with lock:
+            if cache_key not in _EWMA_STATE:
+                loaded = _load_ewma_state(ewma_file)
+                _EWMA_STATE[cache_key] = float(loaded) if loaded is not None else raw_score
+            ewma_raw = _EWMA_STATE[cache_key]
+            ewma_raw = float(ewma_alpha) * raw_score + (1.0 - float(ewma_alpha)) * ewma_raw
+            _EWMA_STATE[cache_key] = ewma_raw
+            _save_ewma_state(ewma_file, ewma_raw)
+        raw_score = _EWMA_STATE[cache_key]
+        n_signals = len(recent_signals)
+        if n_signals >= 2:
+            oldest_ts = _normalize_ts(recent_signals[0][0])
+            newest_ts = _normalize_ts(recent_signals[-1][0])
+            signal_span_sec = newest_ts - oldest_ts if newest_ts > oldest_ts else 0.0
+        if use_volatility_filter or use_vol_norm:
+            vol_tail_bytes = max(int(tail_bytes), 256 * 1024)
+            vol_rows = _read_tail_rows(p, tail_bytes=vol_tail_bytes)
+            if mid_venue_val:
+                mid_series = v3_mid_series_from_rows(vol_rows, mid_venue_val)
+        if use_volatility_filter and mid_venue_val and vol_rows is not None:
+            raw_score = v3_apply_volatility_filter(
+                vol_rows,
+                raw_score,
+                mid_venue_val,
+                window_sec=float(vol_window_sec),
+                hist_window_sec=float(vol_hist_window_sec),
+                multiplier=float(vol_multiplier),
+                decay_factor=float(vol_decay_factor),
+                use_atr=vol_use_atr,
+                vol_extreme_zero=vol_extreme_zero,
+            )
+    else:
+        try:
+            from polymarket_live_one_trade import load_latest_complete_cex_signal  # type: ignore
+        except Exception:
+            try:
+                from trade.polymarket_live_run_current_window import load_latest_complete_cex_signal  # type: ignore
+            except Exception:
+                return 0.0
+        t1 = time.perf_counter()
+        sig = load_latest_complete_cex_signal(
+            p, venues=venues2, weights=weights2, min_abs_score=0.0, tail_bytes=int(tail_bytes),
         )
-        return 0.0
-    
-    # 时间基准：统一用信号最大 t（与数据时间一致，避免 CSV 写入延迟导致 age_sec 异常）
-    now_ts = _normalize_ts(recent_signals[-1][0])
-    # 时间衰减加权平均
-    weighted_sum = 0.0
-    total_weight = 0.0
-    decay_rate_val = float(decay_rate)
-    
-    for t, s in recent_signals:  # 已升序，最新在后
-        t_norm = _normalize_ts(float(t))
-        age_sec = now_ts - t_norm
-        weight = math.exp(-decay_rate_val * age_sec)  # 最新 weight ≈1，老的衰减
-        weighted_sum += weight * float(s)
-        total_weight += weight
-    
-    current_raw = weighted_sum / total_weight if total_weight > 0 else 0.0
-    
-    # EWMA 平滑（跨调用连续性，按 cache_key 区分；持久化到 pkl，多进程/多实例安全；同进程多线程加锁）
-    global _EWMA_STATE
-    lock = _ewma_lock(cache_key)
-    with lock:
-        if cache_key not in _EWMA_STATE:
-            loaded = _load_ewma_state(ewma_file)
-            _EWMA_STATE[cache_key] = float(loaded) if loaded is not None else current_raw
-        ewma_raw = _EWMA_STATE[cache_key]
-        ewma_raw = float(ewma_alpha) * current_raw + (1.0 - float(ewma_alpha)) * ewma_raw
-        _EWMA_STATE[cache_key] = ewma_raw
-        _save_ewma_state(ewma_file, ewma_raw)
-    raw_score = _EWMA_STATE[cache_key]
-    if os.environ.get("CEX_DEBUG_RAW_SCORE") == "1":
-        print(f"[raw_score] {raw_score:.6f}", flush=True)
+        t2 = time.perf_counter()
+        if sig is None:
+            logger.info("[cex] timing path=%s load_signal_s=%.3f total_s=%.3f", p, t2 - t1, t2 - t0)
+            return 0.0
+        try:
+            raw_score = float(sig.score)
+        except Exception:
+            return 0.0
+        timestamp_else = float(sig.t) if (getattr(sig, "t", None) is not None and sig.t != "") else time.time()
 
-    # 需要 mid/vol 时只读一次 tail，供波动率过滤与 normalizer current_mid 复用
-    vol_rows: list[dict[str, str]] = []
-    mid_series: list[tuple[float, float]] = []
-    mid_venue_val = mid_venue if mid_venue is not None else (venues2[0] if venues2 else "binance_spot")
-    need_vol_or_mid = use_volatility_filter or use_normalization or use_zeff_model
-    if need_vol_or_mid:
-        vol_tail_bytes = max(tail_bytes, 256 * 1024)  # 至少 256KB 以覆盖 hist_window
-        vol_rows = _read_tail_rows(p, tail_bytes=vol_tail_bytes)
-        mid_series = _mid_series_from_rows(vol_rows, mid_venue_val) if vol_rows else []
+    timestamp = now_ts if use_v3_raw_score else timestamp_else
 
-    # 波动率过滤：高波动时衰减或置零 raw_score（复用上面 vol_rows）
-    if use_volatility_filter:
-        raw_score = apply_volatility_filter(
-            vol_rows,
-            raw_score,
-            mid_venue_val,
-            window_sec=vol_window_sec,
-            hist_window_sec=vol_hist_window_sec,
-            multiplier=vol_multiplier,
-            decay_factor=vol_decay_factor,
-            use_atr=vol_use_atr,
-            vol_extreme_zero=vol_extreme_zero,
-        )
-
-    # 如果不使用标准化，直接返回原始score
     if not use_normalization:
         if return_meta:
             return CexScoreResult(
@@ -1647,15 +1725,15 @@ def score_cex(
                 meta={"z_score": float(raw_score), "extra_factor": 1.0, "z_eff": float(raw_score)},
             )
         return float(raw_score)
-    
-    # 使用标准化（cache_dir、cache_file、cache_key 已在前面计算）
+
     csv_key = str(p.resolve()) if p.exists() else str(p)
     if csv_key not in _LOGGED_CSV:
-        print(
-            f"[cex] 使用CSV={csv_key} tail_bytes={int(tail_bytes)} lookback_s={int(lookback_seconds)} normalize={bool(use_normalization)}",
-            flush=True,
+        logger.info(
+            "[cex] 使用CSV=%s tail_bytes=%d lookback_s=%d normalize=%s",
+            csv_key, int(tail_bytes), int(lookback_seconds), bool(use_normalization),
         )
         _LOGGED_CSV.add(csv_key)
+    
     normalizer = _NORMALIZER_CACHE.get(cache_key)
     reused_from_memory = normalizer is not None
     loaded_from_disk = False
@@ -1665,34 +1743,49 @@ def score_cex(
         if normalizer is not None:
             loaded_from_disk = True
         else:
+            min_samples_val = 50
+            if normalizer_min_samples is not None:
+                min_samples_val = normalizer_min_samples
+            elif min_samples is not None:
+                min_samples_val = min_samples
+                logger.warning(
+                    "Using deprecated 'min_samples' kwarg, prefer 'normalizer_min_samples'",
+                )
+            if min_samples_val != 50:
+                logger.warning(
+                    "Overriding v3 default min_samples=50 with %d",
+                    min_samples_val,
+                )
             normalizer = AdaptiveScoreNormalizer(
                 lookback_seconds=int(lookback_seconds),
-                min_samples=50,
+                min_samples=min_samples_val,
+                winsorize_prop=float(winsorize_prop),
+                use_vol_norm=bool(use_vol_norm),
+                vol_window_sec=300.0,
+                clip_limit=float(clip_limit),
             )
             created_new = True
         _NORMALIZER_CACHE[cache_key] = normalizer
+    if created_new:
+        cleanup_old_ewma(cache_dir, max_files=50)
     if cache_key not in _LOGGED_NORMALIZER:
         try:
             n_samples = len(normalizer.history)
         except Exception:
             n_samples = 0
-        print(
-            f"[cex] normalizer_cache={cache_key} reused_mem={bool(reused_from_memory)} loaded_disk={bool(loaded_from_disk)} "
-            f"created_new={bool(created_new)} n_samples={int(n_samples)} lookback_s={int(lookback_seconds)} "
-            f"min_samples={int(normalizer.min_samples)}",
-            flush=True,
+        logger.info(
+            "[cex] normalizer_cache=%s reused_mem=%s loaded_disk=%s created_new=%s n_samples=%d lookback_s=%d min_samples=%d",
+            cache_key, bool(reused_from_memory), bool(loaded_from_disk),
+            bool(created_new), int(n_samples), int(lookback_seconds),
+            int(getattr(normalizer, "min_samples", 50)),
         )
         if created_new:
-            print("[cex] normalizer 初始化为空，样本不足时将暂停交易（不会使用 raw_score）", flush=True)
+            logger.info("[cex] normalizer 初始化为空，样本不足时将暂停交易（不会使用 raw_score）")
         _LOGGED_NORMALIZER.add(cache_key)
-    
-    # 当前时间戳（与时间衰减一致，用信号最大 t）
-    timestamp = now_ts
-    
-    # 确保近 2 小时缓存已补齐（永远不使用 raw）
+
     warmup_key = f"{cache_key}:{int(lookback_seconds)}"
     if warmup_key not in _WARMUP_DONE and _needs_warmup(normalizer, now_ts=float(timestamp)):
-        print("[cex] warmup: 检测到缓存不足，开始补齐近 2 小时数据 ...", flush=True)
+        logger.info("[cex] warmup: 检测到缓存不足，开始补齐近 2 小时数据 ...")
         try:
             _warmup_normalizer_from_csv(
                 csv_path=p,
@@ -1703,31 +1796,31 @@ def score_cex(
                 now_ts=float(timestamp),
             )
         except Exception as e:
-            print(f"[cex] warmup: 失败 {type(e).__name__}:{e}", flush=True)
+            logger.warning("[cex] warmup: 失败 %s:%s", type(e).__name__, e)
         _WARMUP_DONE.add(warmup_key)
 
-    # 先标准化再更新（避免 look-ahead）；若 normalizer 启用 vol 归一化则传入当前 mid（复用 mid_series）
     current_mid: Optional[float] = None
-    if normalizer.use_vol_norm and mid_series:
-        current_mid = mid_series[-1][1]
-    if normalizer.use_vol_norm and current_mid is None and cache_key not in _LOGGED_MID_EMPTY:
-        _LOGGED_MID_EMPTY.add(cache_key)
-        print("[cex] normalizer use_vol_norm=True 但 current_mid 为空，vol_history 未更新", flush=True)
+    if use_vol_norm and mid_venue_val:
+        if mid_series is not None:
+            current_mid = mid_series[-1][1] if mid_series else None
+        else:
+            vol_tail_bytes = max(int(tail_bytes), 256 * 1024)
+            vol_rows_mid = _read_tail_rows(p, tail_bytes=vol_tail_bytes)
+            mid_series = v3_mid_series_from_rows(vol_rows_mid, mid_venue_val)
+            if mid_series:
+                current_mid = mid_series[-1][1]
+        if current_mid is None and (mid_series is None or not mid_series):
+            if cache_key not in _LOGGED_MID_SERIES_EMPTY:
+                _LOGGED_MID_SERIES_EMPTY.add(cache_key)
+                logger.warning("[cex] mid_series empty for vol_norm or filter")
+
     normalized_score, stats = normalizer.normalize(raw_score, timestamp)
     normalizer.update(raw_score, timestamp, mid_price=current_mid)
     t3 = time.perf_counter()
-    
-    # 记录聚合统计信息
-    if n_signals > 0:
-        oldest_signal_ts = _normalize_ts(recent_signals[0][0])
-        newest_signal_ts = _normalize_ts(recent_signals[-1][0])
-        signal_span_sec = newest_signal_ts - oldest_signal_ts if newest_signal_ts > oldest_signal_ts else 0.0
-    else:
-        signal_span_sec = 0.0
 
     # 若样本仍不足，返回 0（避免 raw）
     if not bool(stats.get("is_normalized")):
-        print(f"[cex] warn: 样本不足(n={int(stats.get('n_samples') or 0)}), 暂不交易", flush=True)
+        logger.warning("[cex] warn: 样本不足(n=%d), 暂不交易", int(stats.get("n_samples") or 0))
         try:
             normalizer.save_state(cache_file)
         except Exception:
@@ -1746,207 +1839,155 @@ def score_cex(
     extra_factor = 1.0
     mu_val: Optional[float] = None
     offsets_n = 0
-    if use_zeff_model:
-        # v3 MLP zeff: 从模型所在目录加载 zeff_ai_system.py（与 .pth / .scaler.joblib 同目录）
-        import sys
-        _ZeffMLP = None  # type: ignore[assignment]
-        _ZeffFeatures = _ZEFF_MLP_FEATURES  # type: ignore[assignment]
-        if zeff_model_path:
-            _model_dir = Path(zeff_model_path).resolve().parent
-            _zeff_py = _model_dir / "zeff_ai_system.py"
-            if _zeff_py.exists():
-                _s = str(_model_dir)
-                if _s not in sys.path:
-                    sys.path.insert(0, _s)
+    binance_meta: dict[str, Any] = {}
+    if elapsed_time_min is not None and cum_change is not None:
+        try:
+            use_binance_now = use_binance_offsets
+            decay_kw: dict[str, Any] = {
+                "T": float(decay_T),
+                "lambda_base": float(decay_lambda_base),
+                "sigma": float(decay_sigma),
+                "multiplier": float(decay_multiplier),
+                "min_mu": float(decay_min_mu),
+                "max_mu": float(decay_max_mu),
+                "N_windows": int(decay_N_windows),
+            }
+            if decay_params_path:
+                loaded = SignalOptimizer.load_params_from_file(Path(decay_params_path))
+                key_map = {
+                    "decay_T": "T", "decay_lambda_base": "lambda_base", "decay_sigma": "sigma",
+                    "decay_multiplier": "multiplier", "decay_min_mu": "min_mu",
+                    "decay_max_mu": "max_mu", "decay_N_windows": "N_windows",
+                }
+                for k, v in loaded.items():
+                    if k in key_map:
+                        decay_kw[key_map[k]] = v
+                    elif k in ("T", "lambda_base", "sigma", "multiplier", "min_mu", "max_mu", "N_windows",
+                              "ema_alpha_mu", "ema_alpha_lambda", "max_factor", "min_offsets",
+                              "default_mu", "threshold", "conservative_scaling_enabled"):
+                        decay_kw[k] = v
+            offsets: list[float] = []
+            if _binance_failed_since is not None and (time.time() - _binance_failed_since) > 3600:
+                logger.info("Binance cooldown expired, attempting retry")
+            if use_binance_now and (_binance_failed_since is None or (time.time() - _binance_failed_since) > 3600):
                 try:
-                    from zeff_ai_system import ZeffMLP as _ZeffMLP, FEATURES as _ZeffFeatures  # noqa: F811
-                except ImportError as _e:
-                    global _ZEFF_IMPORT_LOGGED
-                    if not _ZEFF_IMPORT_LOGGED:
-                        print(f"[cex] zeff_ai_system import failed (model dir): {_e}", flush=True)
-                        _ZEFF_IMPORT_LOGGED = True
-                    _ZeffMLP = None  # type: ignore[assignment]
-                    _ZeffFeatures = _ZEFF_MLP_FEATURES  # type: ignore[assignment]
-        if _ZeffMLP is not None and zeff_model_path:
-            path_str = str(Path(zeff_model_path).resolve())
-            if path_str not in _ZEFF_MLP_CACHE:
-                import joblib
-                import torch
-                device = torch.device("cpu")
-                scaler_path = Path(zeff_model_path).with_name(Path(zeff_model_path).stem + ".scaler.joblib")
-                scaler = None
-                y_scaler = None
-                features = list(_ZeffFeatures)
-                hidden_sizes = [1024, 512, 256, 128]
-                if scaler_path.exists():
-                    try:
-                        data = joblib.load(scaler_path)
-                        scaler = data.get("scaler")
-                        features = data.get("features", features)
-                        y_scaler = data.get("y_scaler")
-                        hidden_sizes = data.get("hidden_sizes", hidden_sizes)
-                    except Exception:
-                        pass
-                model = _ZeffMLP(input_dim=len(features), hidden_sizes=hidden_sizes, dropout_p=0.3).to(device)
-                model.load_state_dict(torch.load(path_str, map_location="cpu"))
-                model.eval()
-                _ZEFF_MLP_CACHE[path_str] = (model, scaler, y_scaler, features, hidden_sizes)
-                if path_str not in _LOGGED_MLP_LOAD:
-                    print(f"[cex] MLP model loaded on {device}", flush=True)
-                    _LOGGED_MLP_LOAD.add(path_str)
-            model, scaler, y_scaler, feats, _ = _ZEFF_MLP_CACHE[path_str]
-            ewma_raw = _EWMA_STATE.get(cache_key) or 0.0
-            vol_60s = _recent_vol_from_mid_series(mid_series, 60.0) if mid_series else None
-            fd = _build_zeff_features(
-                cache_key, mid_series, float(normalized_score), float(raw_score),
-                float(timestamp), float(ewma_raw), vol_60s,
-                elapsed_seconds=elapsed_seconds,
-                cum_change_abs=cum_change_abs,
+                    offsets, binance_meta = _get_binance_offsets(
+                        symbol="BTC/USDT",
+                        timeframe="1h",
+                        n_windows=int(decay_N_windows),
+                        n_hours=48,
+                        cache_dir=chainlink_cache_dir or normalizer_cache_dir,
+                        max_age_s=float(chainlink_cache_max_age_s),
+                    )
+                except Exception as e:
+                    logger.warning("Binance get offsets failed: %s", e)
+                    offsets = []
+                if not offsets:
+                    use_binance_now = False
+            if not use_binance_now or not offsets:
+                nodes = _fetch_chainlink_history(
+                    feed_id=str(chainlink_feed_id),
+                    time_range=str(chainlink_time_range),
+                    cache_dir=chainlink_cache_dir or normalizer_cache_dir,
+                    max_age_s=float(chainlink_cache_max_age_s),
+                )
+                offsets = _recent_chainlink_offsets(nodes, n_windows=int(decay_N_windows))
+            if not offsets and fallback_path and fallback_path.exists():
+                try:
+                    import pandas as pd
+                    df = pd.read_csv(fallback_path, usecols=["timestamp", "close"])
+                    closes = df["close"].astype(float).tolist()
+                    offsets = [abs(closes[i + 1] - closes[i]) for i in range(len(closes) - 1)][-int(decay_N_windows):]
+                except (FileNotFoundError, PermissionError, Exception) as e:
+                    logger.error("Fallback CSV inaccessible, using hardcoded defaults: %s", e)
+                    offsets = list(default_offsets)
+            elif not offsets:
+                offsets = list(default_offsets)
+            offsets_n = len(offsets)
+            fallback_offsets_list = list(default_offsets) if not offsets else None
+            optimizer = SignalOptimizer(
+                fallback_offsets=fallback_offsets_list,
+                **{k: v for k, v in decay_kw.items() if k in (
+                    "T", "lambda_base", "sigma", "multiplier", "min_mu", "max_mu", "N_windows",
+                    "ema_alpha_mu", "ema_alpha_lambda", "max_factor", "min_offsets",
+                    "default_mu", "threshold", "conservative_scaling_enabled",
+                )},
             )
-            # 特征顺序与缺失：使用 scaler 保存的 features 顺序，缺列填 0
-            vec = [fd.get(k, 0.0) for k in feats]
-            import numpy as np
-            import torch as _torch
-            X = np.array([vec], dtype=np.float32)
-            if scaler is not None:
-                X = scaler.transform(X)
-            x_t = _torch.tensor(X, dtype=_torch.float32)
-            with _torch.no_grad():
-                zeff_scaled = model(x_t).item()
-            if y_scaler is not None:
-                zeff = float(y_scaler.inverse_transform([[zeff_scaled]])[0][0])
+            optimizer.set_historical_offsets(offsets)
+            mu_val = optimizer.compute_dynamic_mu()
+            out = optimizer.dynamic_decay(
+                float(elapsed_time_min), float(cum_change), return_meta=return_meta
+            )
+            if return_meta and isinstance(out, tuple):
+                extra_factor, decay_meta = out
+                z_eff_low = float(normalized_score) * decay_meta.get("decay_low", 1.0)
+                z_eff_high = float(normalized_score) * decay_meta.get("decay_high", 1.0)
+                ema_mu = optimizer.ema_mu or optimizer.default_mu
+                mu_ci = decay_meta.get("mu_ci", (ema_mu * 0.9, ema_mu * 1.1))
+                ci_width = (mu_ci[1] - mu_ci[0]) / max(ema_mu, 1e-9) if ema_mu else 0
+                if optimizer.conservative_scaling_enabled and ci_width > optimizer.threshold:
+                    extra_factor *= 0.8
+                    binance_meta["conservative_scaling"] = True
+                binance_meta["mu_ci"] = mu_ci
+                binance_meta["z_eff_ci"] = (z_eff_low, z_eff_high)
             else:
-                zeff = float(zeff_scaled)
-            zeff = max(-zeff_clip, min(zeff, zeff_clip))
-            z_eff = zeff
-            extra_factor = zeff / float(normalized_score) if abs(normalized_score) > 1e-9 else 1.0
-        else:
-            # MLP 未加载则回退到 z_score
-            global _ZEFF_FALLBACK_LOGGED
-            if not _ZEFF_FALLBACK_LOGGED:
-                print(
-                    f"[cex] use_zeff_model=True but MLP not used (ZeffMLP={_ZeffMLP is not None}, path={bool(zeff_model_path)}), z_eff=z_score fallback",
-                    flush=True,
-                )
-                _ZEFF_FALLBACK_LOGGED = True
-            z_eff = float(normalized_score) * float(extra_factor)
-    elif elapsed_time_min is not None and cum_change is not None:
-        nodes = _fetch_chainlink_history(
-            feed_id=str(chainlink_feed_id),
-            time_range=str(chainlink_time_range),
-            cache_dir=chainlink_cache_dir or normalizer_cache_dir,
-            max_age_s=float(chainlink_cache_max_age_s),
-        )
-        offsets = _recent_chainlink_offsets(nodes, n_windows=int(decay_N_windows))
-        offsets_n = len(offsets)
-        optimizer = SignalOptimizer(
-            T=float(decay_T),
-            lambda_base=float(decay_lambda_base),
-            sigma=float(decay_sigma),
-            multiplier=float(decay_multiplier),
-            min_mu=float(decay_min_mu),
-            max_mu=float(decay_max_mu),
-            N_windows=int(decay_N_windows),
-        )
-        optimizer.set_historical_offsets(offsets)
-        mu_val = optimizer.compute_dynamic_mu()
-        if use_zeff_calculator:
-            recent_vol = (
-                _recent_vol_from_mid_series(mid_series, vol_window_sec)
-                if mid_series
-                else None
-            )
-            vol_mean = None
-            if normalizer.use_vol_norm and len(normalizer.vol_history) >= 30:
-                vol_mean = _vol_mean_from_vol_history(normalizer.vol_history)
-            if vol_mean is None and mid_series:
-                vol_mean = _vol_mean_from_mid_series(
-                    mid_series, vol_window_sec, vol_hist_window_sec
-                )
-            if cache_key not in _ZEFF_CALC_CACHE:
-                _ZEFF_CALC_CACHE[cache_key] = ZeffCalculator(
-                    lambda_base=zeff_lambda_base,
-                    sigma=zeff_sigma,
-                    vol_decay_mult=zeff_vol_decay_mult,
-                    noise_ema_alpha=zeff_noise_ema_alpha,
-                    rl_acc_window=zeff_rl_acc_window,
-                    rl_adjust_range=zeff_rl_adjust_range,
-                    rl_low_thresh=zeff_rl_low_thresh,
-                    rl_high_thresh=zeff_rl_high_thresh,
-                    zeff_clip=zeff_clip,
-                    sigma_noise=zeff_sigma_noise,
-                    rl_linear=zeff_rl_linear,
-                )
-            zeff_calc = _ZEFF_CALC_CACHE[cache_key]
-            # sigma_noise 动态取当次 normalize 的 stats['mad']，缺或过小则 ZeffCalculator 内用默认 0.3
-            mad = stats.get("mad")
-            zeff = zeff_calc.compute_zeff(
-                float(normalized_score),
-                float(elapsed_time_min),
-                float(cum_change),
-                recent_vol,
-                vol_mean,
-                raw_score,
-                mu_val,
-                mad=float(mad) if mad is not None else None,
-            )
-            extra_factor = (
-                zeff / float(normalized_score)
-                if abs(normalized_score) > 1e-9
-                else 1.0
-            )
-            z_eff = zeff
-            if feedback_acc is not None:
-                zeff_calc.update_rl_acc(feedback_acc)
-        else:
-            extra_factor = optimizer.dynamic_decay(
-                float(elapsed_time_min), float(cum_change)
-            )
-            z_eff = float(normalized_score) * float(extra_factor)
-    else:
-        z_eff = float(normalized_score) * float(extra_factor)
+                extra_factor = float(out)
+            _consecutive_failures = 0
+            _binance_failed_since = None
+        except Exception as e:
+            _consecutive_failures += 1
+            if _consecutive_failures > 3:
+                logger.error("Consecutive failures > 3 (score_cex decay)")
+                sys.stderr.write("[cex] ERROR: Consecutive failures > 3\n")
+                if use_binance_now:
+                    _binance_failed_since = time.time()
+            extra_factor = 1.0
+            z_eff = 0.0
+            if return_meta:
+                meta = dict(stats or {})
+                meta.update({
+                    "z_score": float(normalized_score),
+                    "extra_factor": 1.0,
+                    "z_eff": 0.0,
+                    "mu": None,
+                    "offsets_n": 0,
+                    "error": str(e) or type(e).__name__,
+                })
+                return CexScoreResult(score=0.0, meta=meta)
+            return 0.0
+    z_eff = float(normalized_score) * float(extra_factor)
 
     if return_meta:
         meta = dict(stats or {})
-        meta.update(
-            {
-                "z_score": float(normalized_score),
-                "extra_factor": float(extra_factor),
-                "z_eff": float(z_eff),
-                "mu": float(mu_val) if mu_val is not None else None,
-                "offsets_n": int(offsets_n),
-                "n_signals": int(n_signals),
-                "time_window_sec": float(time_window_sec),
-                "decay_rate": float(decay_rate),
-                "ewma_alpha": float(ewma_alpha),
-                "signal_span_sec": float(signal_span_sec),
-            }
-        )
-        print(
-            f"[cex] timing path={p} load_signals_s={t2 - t1:.3f} "
-            f"normalize_s={t3 - t2:.3f} save_s={t4 - t3:.3f} total_s={t4 - t0:.3f} "
-            f"n_signals={n_signals} time_window_sec={time_window_sec:.1f} signal_span_sec={signal_span_sec:.1f}",
-            flush=True,
+        meta.update({
+            "raw_score": float(raw_score),
+            "raw_n_signals": int(n_signals),
+            "raw_time_window_sec": float(time_window_sec),
+            "raw_decay_rate": float(decay_rate),
+            "raw_ewma_alpha": float(ewma_alpha),
+            "raw_signal_span_sec": float(signal_span_sec),
+            "raw_use_volatility_filter": bool(use_volatility_filter),
+            "raw_use_dynamic_weights": bool(use_dynamic_weights),
+            "raw_normalizer_min_samples": int(getattr(normalizer, "min_samples", 50)),
+            "raw_mid_venue_used": mid_venue_val,
+            "z_score": float(normalized_score),
+            "z_extra_factor": float(extra_factor),
+            "z_eff": float(z_eff),
+            "z_mu": float(mu_val) if mu_val is not None else None,
+            "z_offsets_n": int(offsets_n),
+        })
+        meta.update(binance_meta)
+        logger.info(
+            "[cex] timing path=%s load_signal_s=%.3f normalize_s=%.3f save_s=%.3f total_s=%.3f n_signals=%s",
+            p, t2 - t1, t3 - t2, t4 - t3, t4 - t0, n_signals,
         )
         return CexScoreResult(score=float(normalized_score), meta=meta)
 
-    print(
-        f"[cex] timing path={p} load_signals_s={t2 - t1:.3f} "
-        f"normalize_s={t3 - t2:.3f} save_s={t4 - t3:.3f} total_s={t4 - t0:.3f} "
-        f"n_signals={n_signals} time_window_sec={time_window_sec:.1f}",
-        flush=True,
+    logger.info(
+        "[cex] timing path=%s load_signal_s=%.3f normalize_s=%.3f save_s=%.3f total_s=%.3f",
+        p, t2 - t1, t3 - t2, t4 - t3, t4 - t0,
     )
     return float(normalized_score)
-
-
-def update_zeff_rl_acc(cache_key: str, acc: float) -> None:
-    """
-    供 daemon/策略写入历史准确率，用于 ZeffCalculator 的 rl_adjust。
-    需使用与 score_cex 一致的 cache_key（同一 symbol/path 的 cache 键）。
-    """
-    zeff_calc = _ZEFF_CALC_CACHE.get(cache_key)
-    if zeff_calc is not None:
-        zeff_calc.update_rl_acc(float(acc))
 
 
 def ensure_cex_warmup(
@@ -1982,7 +2023,7 @@ def ensure_cex_warmup(
     cache_file = cache_dir / f"cex_normalizer_{symbol}.pkl"
     cache_key = str(cache_file.resolve())
 
-    print(f"[cex] warmup: start cache={cache_key}", flush=True)
+    logger.info("[cex] warmup: start cache=%s", cache_key)
     normalizer = _NORMALIZER_CACHE.get(cache_key)
     if normalizer is None:
         normalizer = AdaptiveScoreNormalizer.load_state(cache_file)
@@ -2000,11 +2041,11 @@ def ensure_cex_warmup(
             normalizer.history = deque()
         except Exception:
             pass
-        print("[cex] warmup: reset history for full backfill", flush=True)
+        logger.info("[cex] warmup: reset history for full backfill")
         try:
             prev = _prev_cex_slice_path(p)
             if prev is not None:
-                print(f"[cex] warmup: try prev slice {prev}", flush=True)
+                logger.info("[cex] warmup: try prev slice %s", prev)
                 _warmup_normalizer_from_csv(
                     csv_path=prev,
                     normalizer=normalizer,
@@ -2022,7 +2063,7 @@ def ensure_cex_warmup(
                 now_ts=float(now_ts),
             )
         except Exception as e:
-            print(f"[cex] warmup: 失败 {type(e).__name__}:{e}", flush=True)
+            logger.warning("[cex] warmup: 失败 %s:%s", type(e).__name__, e)
 
     try:
         normalizer.save_state(cache_file)
@@ -2041,9 +2082,9 @@ def ensure_cex_warmup(
     except Exception:
         oldest, newest, span_s = 0.0, 0.0, 0.0
     now_s = _normalize_ts(time.time())
-    print(
-        f"[cex] warmup: done ok={bool(ok)} n_samples={int(n_samples)} span_s={span_s:.1f} now={now_s:.1f} oldest={oldest:.1f} newest={newest:.1f}",
-        flush=True,
+    logger.info(
+        "[cex] warmup: done ok=%s n_samples=%d span_s=%.1f now=%.1f oldest=%.1f newest=%.1f",
+        bool(ok), int(n_samples), span_s, now_s, oldest, newest,
     )
     return bool(ok)
 
@@ -2086,4 +2127,9 @@ def _auto_detect_cex_slice(symbol: str) -> Path:
     
     # 返回默认路径（可能不存在）
     return Path(f"real_hot/cex_{symbol}_{day}_{label}.csv")
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    # Optional for production: logger.addHandler(logging.FileHandler("cex.log"))
 
