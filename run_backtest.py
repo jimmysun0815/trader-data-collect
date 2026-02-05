@@ -27,6 +27,7 @@ import logging
 from pathlib import Path
 
 import pandas as pd
+import cex_scorer_v4  # Added import
 
 from cex_scorer_backtest import (
     backtest_optimizer,
@@ -248,6 +249,10 @@ def main() -> None:
             else:
                 args.cex_csvs = sorted(current_cex_paths, key=lambda p: _cex_time_range(p) or (0, 0))
             if args.eval_mode == "per_second":
+                # Reset global state before running backtest to ensure clean environment
+                cex_scorer_v4.reset_global_state()
+                logger.info("已重置全局状态 (reset_global_state) 以保证回测纯净")
+
                 logger.info("Per-second 回测: CEX %d 文件, 时长 %.1fh (仅 raw/zscore vs 5s 后 BTC)%s", len(args.cex_csvs), args.duration_hours, ", 全时段" if args.no_high_acc else "")
                 res = backtest_raw_zscore_per_second(
                     list(args.cex_csvs),
@@ -329,6 +334,10 @@ def main() -> None:
             )
 
     if args.cex_csvs and args.poly_jsonls:
+        # Reset global state before running backtest to ensure clean environment
+        cex_scorer_v4.reset_global_state()
+        logger.info("已重置全局状态 (reset_global_state) 以保证回测纯净")
+
         logger.info("Zeff full 回测: CEX %d 文件, Poly %d 文件, thresh=%.2f", len(args.cex_csvs), len(args.poly_jsonls), args.thresh)
         res = backtest_zeff_full(
             list(args.cex_csvs),

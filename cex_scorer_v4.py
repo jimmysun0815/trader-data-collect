@@ -51,6 +51,33 @@ _BINANCE_OHLCV_DEQUE: Optional[deque] = None
 _BINANCE_DEQUE_MAXLEN: int = 48
 
 
+def reset_global_state() -> None:
+    """
+    重置所有全局缓存状态（内存级）。
+    用于回测或长时间运行后防止状态污染。
+    """
+    global _consecutive_failures, _binance_failed_since, _BINANCE_OHLCV_DEQUE
+    
+    _NORMALIZER_CACHE.clear()
+    _LOGGED_NORMALIZER.clear()
+    _LOGGED_CSV.clear()
+    _LOGGED_VOL_FALLBACK.clear()
+    _LOGGED_MID_EMPTY.clear()
+    _LOGGED_MID_SERIES_EMPTY.clear()
+    _WARMUP_DONE.clear()
+    _TS_WARNED.clear()
+    _CHAINLINK_CACHE.clear()
+    _EWMA_STATE.clear()
+    # _EWMA_LOCKS 不清空，保留锁对象以防竞态，但在单线程回测中无影响
+    
+    _consecutive_failures = 0
+    _binance_failed_since = None
+    _BINANCE_OHLCV_DEQUE = None
+    _BINANCE_OFFSETS_CACHE.clear()
+    
+    logger.info("[cex] Global state reset complete (memory cleared).")
+
+
 def _read_csv_header(path: Path) -> list[str]:
     with path.open("r", encoding="utf-8", errors="replace") as f:
         line = f.readline().strip("\n")
@@ -1530,6 +1557,7 @@ def score_cex(
     clip_limit: float = 3.0,
     normalizer_min_samples: Optional[int] = None,
     min_samples: Optional[int] = None,
+    allow_disk_cache: bool = True,
 ) -> float | CexScoreResult:
     """
     CEX 打分器壳：输入 live CSV + 参数（权重等）→ 输出单一 float score。
@@ -1571,6 +1599,7 @@ def score_cex(
     use_vol_norm, winsorize_prop, clip_limit: normalizer v3 参数。
     normalizer_min_samples: 覆盖 v3 默认 50 时打警告。
     min_samples: 已废弃，请用 normalizer_min_samples；若传入则覆盖 normalizer_min_samples 并打 warning。
+    allow_disk_cache: 是否允许读写磁盘缓存（pkl文件）。回测时建议设为False以保证环境纯净。
 
     Returns:
         标准化后的score（如果use_normalization=True），否则返回原始score。
@@ -1739,7 +1768,11 @@ def score_cex(
     loaded_from_disk = False
     created_new = False
     if normalizer is None:
-        normalizer = AdaptiveScoreNormalizer.load_state(cache_file)
+        if allow_disk_cache:
+            normalizer = AdaptiveScoreNormalizer.load_state(cache_file)
+        else:
+            normalizer = None
+            
         if normalizer is not None:
             loaded_from_disk = True
         else:
@@ -1831,7 +1864,8 @@ def score_cex(
     
     # 保存状态
     try:
-        normalizer.save_state(cache_file)
+        if allow_disk_cache:
+            normalizer.save_state(cache_file)
     except Exception:
         pass  # 保存失败不影响返回结果
     t4 = time.perf_counter()

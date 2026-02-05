@@ -552,6 +552,7 @@ def backtest_zeff_full(
             )
             
             # Update normalizer (don't need z_score during warmup)
+            # Pass allow_disk_cache=False to prevent disk writes during warmup
             normalizer.update(raw_score, float(t))
         
         logger.info("Fold %d: warmup complete, normalizer has %d samples, ewma_state=%.4f",
