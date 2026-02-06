@@ -150,11 +150,11 @@ def fetch_binance_depth(symbol: str, limit: int, timeout_s: float, venue: str) -
     """获取Binance现货depth"""
     base = _BINANCE_POOL.current_base()
     try:
-    j = http_get_json(
+        j = http_get_json(
             f"{base}/api/v3/depth",
-        params={"symbol": symbol, "limit": str(limit)},
-        timeout_s=timeout_s
-    )
+            params={"symbol": symbol, "limit": str(limit)},
+            timeout_s=timeout_s
+        )
         _BINANCE_POOL.record_success()
     except requests.HTTPError as exc:
         status = getattr(exc.response, "status_code", None)
@@ -381,7 +381,7 @@ class AssetRecorder:
     def collect_tick(self, *, enable_write: bool = True) -> dict[str, Any]:
         """采集一个tick的数据（并行请求所有venue）"""
         if enable_write:
-        self._check_rotate_file()
+            self._check_rotate_file()
         
         t0 = time.time()
         ts = utc_ts()
@@ -402,34 +402,34 @@ class AssetRecorder:
             for future in as_completed(futures):
                 venue, book, err = future.result()
                 total += 1
-                
+
                 if book and not err:
                     ok += 1
                     if enable_write:
-                    # 成功 - 写入完整数据
-                    feats = compute_features(book, self.band_bps)
-                    self.current_writer.writerow([
-                        ts, f"{t0:.6f}", self.sample_id, venue,
-                        book.best_bid, book.best_ask, book.mid, book.spread,
-                        book.bid_qty_l1, book.ask_qty_l1,
-                        feats["bid_notional"], feats["ask_notional"],
-                        feats["imb"], feats["micro"], feats["micro_edge"],
-                        ""
-                    ])
+                        # 成功 - 写入完整数据
+                        feats = compute_features(book, self.band_bps)
+                        self.current_writer.writerow([
+                            ts, f"{t0:.6f}", self.sample_id, venue,
+                            book.best_bid, book.best_ask, book.mid, book.spread,
+                            book.bid_qty_l1, book.ask_qty_l1,
+                            feats["bid_notional"], feats["ask_notional"],
+                            feats["imb"], feats["micro"], feats["micro_edge"],
+                            ""
+                        ])
                 else:
                     err_rows += 1
                     if enable_write:
-                    # 失败 - 写入错误行
-                    self.current_writer.writerow([
-                        ts, f"{t0:.6f}", self.sample_id, venue,
-                        "", "", "", "", "", "",
-                        "", "", "", "", "",
-                        err
-                    ])
+                        # 失败 - 写入错误行
+                        self.current_writer.writerow([
+                            ts, f"{t0:.6f}", self.sample_id, venue,
+                            "", "", "", "", "", "",
+                            "", "", "", "", "",
+                            err
+                        ])
         
         # 刷新到磁盘
         if enable_write and self.current_file:
-        self.current_file.flush()
+            self.current_file.flush()
         elapsed = time.time() - t0
         return {
             "asset": self.asset,
@@ -539,22 +539,22 @@ def main():
     timeout_s = float(args.timeout_s)
     test_seconds = float(args.test_seconds)
     log_dir = Path(args.log_dir)
-    
+
     print(f"[INFO] CEX多资产采集器启动", file=sys.stderr)
     print(f"[INFO] 输出目录: {output_dir}", file=sys.stderr)
     print(f"[INFO] 资产: {', '.join(ASSETS.keys())}", file=sys.stderr)
     print(f"[INFO] 采集频率: {hz} Hz", file=sys.stderr)
     print(f"[INFO] 文件切分: 每12小时", file=sys.stderr)
     print(f"[INFO] timeout_s: {timeout_s}", file=sys.stderr)
-    
+
     # 创建每个资产的采集器
     recorders = {
         asset: AssetRecorder(asset, output_dir, band_bps, limit, timeout_s)
         for asset in ASSETS.keys()
     }
-    
+
     interval = 1.0 / hz if hz > 0 else 0.0
-    
+
     try:
         with ThreadPoolExecutor(max_workers=len(recorders)) as executor:
             if test_seconds > 0:
@@ -571,8 +571,8 @@ def main():
                 print(f"[INFO] benchmark_summary: {summary}", file=sys.stderr)
                 return 0
 
-        while True:
-            t0 = time.time()
+            while True:
+                t0 = time.time()
                 futures = {
                     executor.submit(recorder.collect_tick, enable_write=True): asset
                     for asset, recorder in recorders.items()
@@ -581,15 +581,15 @@ def main():
                     asset = futures[future]
                     try:
                         future.result()
-                except Exception as e:
-                    print(f"[ERROR] {asset} tick failed: {e}", file=sys.stderr)
-            
-            # 控制采集频率
-            dt = time.time() - t0
-            to_sleep = interval - dt
-            if to_sleep > 0:
-                time.sleep(to_sleep)
-                
+                    except Exception as e:
+                        print(f"[ERROR] {asset} tick failed: {e}", file=sys.stderr)
+
+                # 控制采集频率
+                dt = time.time() - t0
+                to_sleep = interval - dt
+                if to_sleep > 0:
+                    time.sleep(to_sleep)
+
     except KeyboardInterrupt:
         print("\n[INFO] Shutting down...", file=sys.stderr)
     finally:
@@ -597,7 +597,7 @@ def main():
         for asset, recorder in recorders.items():
             recorder.close()
             print(f"[INFO] Closed recorder for {asset}", file=sys.stderr)
-    
+
     print("[INFO] Recorder stopped", file=sys.stderr)
     return 0
 
